@@ -14,7 +14,7 @@
 > - **`HttpHookTokenValidator`** —— 把 token POST 到你自己的接口，
 >   **这是接入自有用户体系的入口**。
 >
-> 业务规则同理：`flare-im-core/crates/flare-im-hooks` 提供 9 个扩展点
+> 业务规则同理：`flare-core-server/crates/flare-im-hooks` 提供 9 个扩展点
 > （PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction /
 > ConversationLifecycle / ConversationMember / GetConversationParticipants）。
 >
@@ -29,14 +29,14 @@
 [![Documentation](https://docs.rs/flare-core/badge.svg)](https://docs.rs/flare-core)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org/)
-[![GitHub](https://img.shields.io/github/stars/flare-im/flare-core?style=social&label=GitHub)](https://github.com/flare-im/flare-core)
+[![GitHub](https://img.shields.io/github/stars/flare-im/flare-core?style=social&label=GitHub)](https://github.com/flare-im/flare-transport)
 
-[![WebSocket](https://img.shields.io/badge/WebSocket-ws%2Fwss-4CAF50)](https://github.com/flare-im/flare-core)
-[![QUIC](https://img.shields.io/badge/QUIC-UDP%2FTLS-2196F3)](https://github.com/flare-im/flare-core)
-[![TCP](https://img.shields.io/badge/TCP-length--prefixed-607D8B)](https://github.com/flare-im/flare-core)
+[![WebSocket](https://img.shields.io/badge/WebSocket-ws%2Fwss-4CAF50)](https://github.com/flare-im/flare-transport)
+[![QUIC](https://img.shields.io/badge/QUIC-UDP%2FTLS-2196F3)](https://github.com/flare-im/flare-transport)
+[![TCP](https://img.shields.io/badge/TCP-length--prefixed-607D8B)](https://github.com/flare-im/flare-transport)
 [![Tokio](https://img.shields.io/badge/Tokio-async-000000?logo=rust&logoColor=white)](https://tokio.rs/)
-[![Protobuf](https://img.shields.io/badge/Protobuf-negotiation-9C27B0)](https://github.com/flare-im/flare-core)
-[![WASM](https://img.shields.io/badge/WASM-web%20client-FF9800)](https://github.com/flare-im/flare-core)
+[![Protobuf](https://img.shields.io/badge/Protobuf-negotiation-9C27B0)](https://github.com/flare-im/flare-transport)
+[![WASM](https://img.shields.io/badge/WASM-web%20client-FF9800)](https://github.com/flare-im/flare-transport)
 
 `flare-core` 是一个面向生产的 Rust 长连接工具库。它为即时通讯网关、聊天室、
 推送通道、协作工具、低延迟应用后端等实时系统提供传输层基座。
@@ -206,7 +206,7 @@ RUST_LOG=info cargo run --example tcp_client --features tcp
 ```
 
 更多示例见仓库文档：
-[examples/README.md](https://github.com/flare-im/flare-core/blob/main/examples/README.md)。
+[examples/README.md](https://github.com/flare-im/flare-transport/blob/main/examples/README.md)。
 
 ## 原生与 WASM 支持
 
@@ -221,7 +221,7 @@ RUST_LOG=info cargo run --example tcp_client --features tcp
 | Negotiated heartbeat | yes | yes |
 
 浏览器 demo 见
-[examples/wasm_websocket_client](https://github.com/flare-im/flare-core/tree/main/examples/wasm_websocket_client)。
+[examples/wasm_websocket_client](https://github.com/flare-im/flare-transport/tree/main/examples/wasm_websocket_client)。
 
 ## 验证
 
@@ -272,16 +272,16 @@ crate 级文档为 crates.io 和 docs.rs 保持英文。
 | Timeout cleanup, 1,000 connections | ~0.727 ms/op |
 
 完整报告：
-[docs/performance-baseline.md](https://github.com/flare-im/flare-core/blob/main/docs/performance-baseline.md)。
+[docs/performance-baseline.md](https://github.com/flare-im/flare-transport/blob/main/docs/performance-baseline.md)。
 
 ## 文档
 
 | Resource | Link |
 |----------|------|
 | API reference | [docs.rs/flare-core](https://docs.rs/flare-core) |
-| Examples | [examples/README.md](https://github.com/flare-im/flare-core/blob/main/examples/README.md) |
-| Performance report | [docs/performance-baseline.md](https://github.com/flare-im/flare-core/blob/main/docs/performance-baseline.md) |
-| Issues | [GitHub Issues](https://github.com/flare-im/flare-core/issues) |
+| Examples | [examples/README.md](https://github.com/flare-im/flare-transport/blob/main/examples/README.md) |
+| Performance report | [docs/performance-baseline.md](https://github.com/flare-im/flare-transport/blob/main/docs/performance-baseline.md) |
+| Issues | [GitHub Issues](https://github.com/flare-im/flare-transport/issues) |
 
 ## 许可证
 
@@ -293,7 +293,7 @@ crate 级文档为 crates.io 和 docs.rs 保持英文。
 
 | 想做什么 | 去哪里 |
 |---|---|
-| **五分钟跑起来** | [QUICKSTART](https://github.com/flare-im/flare-im-core-server/blob/main/QUICKSTART.md) —— 起服务、手签 token、调通接口，**不需要自建用户体系** |
+| **五分钟跑起来** | [QUICKSTART](https://github.com/flare-im/flare-core-server/blob/main/QUICKSTART.md) —— 起服务、手签 token、调通接口，**不需要自建用户体系** |
 | 接入自己的用户系统 | 实现 `TokenValidator`（`CoreJwtTokenValidator` 本地验签 / `HttpHookTokenValidator` 调你的接口） |
 | 加自己的业务规则 | `flare-im-hooks` 的 9 个扩展点：PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction / ConversationLifecycle / ConversationMember / GetConversationParticipants |
 | 做界面 | [`@flare-im/vue-ui`](https://www.npmjs.com/package/@flare-im/vue-ui) —— 107 个组件，四端一致的契约 |
@@ -308,5 +308,5 @@ crate 级文档为 crates.io 和 docs.rs 保持英文。
 
 咨询：`flare1522@163.com`
 
-> 边界划分与不变承诺见 [GOVERNANCE](https://github.com/flare-im/flare-im-core-server/blob/main/.github/GOVERNANCE.md)。
+> 边界划分与不变承诺见 [GOVERNANCE](https://github.com/flare-im/flare-core-server/blob/main/.github/GOVERNANCE.md)。
 > 简言之：**已开源的不会被收回，鉴权与 hooks 契约永远开源、不会为逼迫付费而阉割。**

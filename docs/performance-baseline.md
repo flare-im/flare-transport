@@ -121,7 +121,7 @@ cargo bench --bench perf_baseline
 上面都是进程内基准。真实容量必须连着服务端与数据库测：
 
 ```bash
-# 1) 起全栈（见 flare-im-core/QUICKSTART.md）
+# 1) 起全栈（见 flare-core-server/QUICKSTART.md）
 cd flare-im-core && docker compose -f deploy/docker-compose.yml up -d && ./scripts/start_server.sh
 
 # 2) 两用户端到端时延与吞吐

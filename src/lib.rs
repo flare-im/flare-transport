@@ -86,7 +86,7 @@
 //!
 //! See the repository README for installation, examples, performance baselines,
 //! and release verification guidance:
-//! <https://github.com/flare-im/flare-core>.
+//! <https://github.com/flare-im/flare-transport>.
 
 pub mod common;
 

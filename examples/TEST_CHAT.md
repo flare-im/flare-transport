@@ -7,7 +7,7 @@
 #### 终端 1: 启动服务器
 
 ```bash
-cd /Users/hg/workspace/flare/flare-im/flare-core
+cd /Users/hg/workspace/flare/flare-im/flare-transport
 RUST_LOG=debug cargo run --example flare_chat_server
 ```
 
@@ -21,7 +21,7 @@ RUST_LOG=debug cargo run --example flare_chat_server
 #### 终端 2: 启动第一个客户端（用户 alice）
 
 ```bash
-cd /Users/hg/workspace/flare/flare-im/flare-core
+cd /Users/hg/workspace/flare/flare-im/flare-transport
 RUST_LOG=debug cargo run --example flare_chat_client -- alice
 ```
 
@@ -35,7 +35,7 @@ RUST_LOG=debug cargo run --example flare_chat_client -- alice
 #### 终端 3: 启动第二个客户端（用户 bob）
 
 ```bash
-cd /Users/hg/workspace/flare/flare-im/flare-core
+cd /Users/hg/workspace/flare/flare-im/flare-transport
 RUST_LOG=debug cargo run --example flare_chat_client -- bob
 ```
 
