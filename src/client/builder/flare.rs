@@ -444,6 +444,15 @@ impl FlareClient {
         self.wrapper.set_heartbeat_app_state(state).await;
     }
 
+    /// 对当前连接做一次即时验活（不改前后台状态）：立即 ping，验活窗口内无 PONG 即断开，
+    /// 断开原因为心跳超时，上层按断线重连处理。
+    ///
+    /// 立即返回，不等客户端锁：发送正在等回执时也能马上生效。没有在跑的心跳时，唤醒留到心跳
+    /// 启动后立即验活一次，无害。
+    pub fn probe_heartbeat(&self) {
+        self.wrapper.probe_heartbeat();
+    }
+
     /// 更新 NAT 空闲超时探测结果。传入 `None` 表示清除探测值。
     pub async fn set_heartbeat_nat_timeout(&self, timeout: Option<std::time::Duration>) {
         self.wrapper.set_heartbeat_nat_timeout(timeout).await;

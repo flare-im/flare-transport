@@ -39,22 +39,29 @@ pub struct ClientWrapper {
     #[cfg(target_arch = "wasm32")]
     client: Arc<Mutex<WebSocketClient>>,
     reconnect_gate: Arc<Mutex<()>>,
+    /// 心跳验活唤醒，建客户端时从它的 core 取一份。core 的这份句柄在客户端整个生命周期内不变
+    /// （竞速中各协议的 core 共享同一份），所以请求验活不必拿 `client` 锁，见 [`Self::probe_heartbeat`]。
+    heartbeat_probe_wake: Arc<tokio::sync::Notify>,
 }
 
 impl ClientWrapper {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(client: HybridClient) -> Self {
+        let heartbeat_probe_wake = client.core().heartbeat_probe_handle();
         Self {
             client: Arc::new(Mutex::new(client)),
             reconnect_gate: Arc::new(Mutex::new(())),
+            heartbeat_probe_wake,
         }
     }
 
     #[cfg(target_arch = "wasm32")]
     pub fn new(client: WebSocketClient) -> Self {
+        let heartbeat_probe_wake = client.core().heartbeat_probe_handle();
         Self {
             client: Arc::new(Mutex::new(client)),
             reconnect_gate: Arc::new(Mutex::new(())),
+            heartbeat_probe_wake,
         }
     }
 
@@ -220,6 +227,12 @@ impl ClientWrapper {
         .await;
     }
 
+    /// 请求一次即时验活，不拿 `client` 锁：`send_frame_and_wait` 等回执期间一直占着这把锁，
+    /// 而「发出去迟迟没回执」正是最需要验活的时候。
+    pub fn probe_heartbeat(&self) {
+        self.heartbeat_probe_wake.notify_one();
+    }
+
     pub async fn set_heartbeat_nat_timeout(&self, timeout: Option<Duration>) {
         self.with_core(|core| {
             core.set_heartbeat_nat_timeout(timeout);
@@ -365,5 +378,21 @@ mod tests {
             "by default a send dials the server first"
         );
         server.abort();
+    }
+
+    /// 发送等回执时客户端锁一直被占着；验活请求不能排在它后面，要立即送到心跳。
+    #[tokio::test]
+    async fn a_probe_request_does_not_wait_for_the_client_lock() {
+        let config = ClientConfig::new("ws://127.0.0.1:9/ws".to_string()).websocket();
+        let client = HybridClient::new(config).expect("hybrid client");
+        let heartbeat_wake = client.core().heartbeat_probe_handle();
+        let wrapper = ClientWrapper::new(client);
+
+        let _held_by_a_pending_send = wrapper.client.lock().await;
+        wrapper.probe_heartbeat();
+
+        tokio::time::timeout(Duration::from_millis(100), heartbeat_wake.notified())
+            .await
+            .expect("the heartbeat is woken while the client lock is held");
     }
 }

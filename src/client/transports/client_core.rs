@@ -1367,6 +1367,21 @@ impl ClientCore {
         }
     }
 
+    /// 不改前后台状态，只对当前连接做一次即时验活：立即发一枚 ping，验活窗口内收不到 PONG
+    /// 就按心跳超时断开，交给上层的断开 → 重连路径。
+    ///
+    /// 给「连接看起来还在、但有理由怀疑它已经死了」的时刻用：网络切换（旧 IP 上的连接多半已被
+    /// 中间设备丢弃，本端却收不到任何关闭信号）、消息发出后迟迟等不到回执。心跳尚未启动时
+    /// 唤醒会留到心跳启动后立即验活一次，无害。
+    pub fn probe_heartbeat(&self) {
+        self.heartbeat_probe_wake.notify_one();
+    }
+
+    /// 验活唤醒句柄，供包装层在不拿客户端锁的情况下请求验活（等价于 [`Self::probe_heartbeat`]）。
+    pub(crate) fn heartbeat_probe_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.heartbeat_probe_wake)
+    }
+
     /// 更新 NAT 空闲超时探测结果。
     pub fn set_heartbeat_nat_timeout(&self, timeout: Option<std::time::Duration>) {
         self.update_heartbeat_config(|config| {
