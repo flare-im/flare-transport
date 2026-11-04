@@ -1,6 +1,6 @@
-# Flare Core
+# Flare Transport
 
-English · [中文](README.zh-CN.md)
+English · [Simplified Chinese](README.zh-CN.md)
 
 > ## ℹ This is communication infrastructure, not a ready-to-use IM product
 >
@@ -308,24 +308,20 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
-## 下一步
+## Next Steps
 
-| 想做什么 | 去哪里 |
-|---|---|
-| **五分钟跑起来** | [QUICKSTART](https://github.com/flare-im/flare-core-server/blob/main/QUICKSTART.md) —— 起服务、手签 token、调通接口，**不需要自建用户体系** |
-| 接入自己的用户系统 | 实现 `TokenValidator`（`CoreJwtTokenValidator` 本地验签 / `HttpHookTokenValidator` 调你的接口） |
-| 加自己的业务规则 | `flare-im-hooks` 的 9 个扩展点：PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction / ConversationLifecycle / ConversationMember / GetConversationParticipants |
-| 做界面 | [`@flare-im/vue-ui`](https://www.npmjs.com/package/@flare-im/vue-ui) —— 107 个组件，四端一致的契约 |
-| 报安全问题 | [SECURITY.md](.github/SECURITY.md)，**请勿开公开 issue** |
+| Goal | Start here |
+| --- | --- |
+| Start a Core messaging server | [Core quickstart](https://github.com/flare-im/flare-core-server/blob/main/docs/QUICKSTART.md) |
+| Connect your own identity provider | [Core authentication and token issuance](https://github.com/flare-im/flare-core-server/blob/main/docs/AUTH-TOKEN-ISSUANCE.md) |
+| Add business rules around messaging | [Core hook contract](https://github.com/flare-im/flare-core-server/blob/main/docs/HOOK-PLUGIN-CONTRACT.md) |
+| Build an IM interface | [Flare UI](https://github.com/flare-im/flare-im-design) |
+| Report a security issue | [Security policy](.github/SECURITY.md) |
 
-## 需要账号体系与社交能力时
+## Identity and Social Features
 
-开源部分是**通信基础设施**。如果你需要的是现成的账号、好友关系、群治理（角色 / 入群审批 / 禁言）、朋友圈，
-这些在商业模块里 —— 自研这一层通常要数月，且都是与通信无关的重复劳动。
+The open-source Core provides messaging infrastructure. You can connect your own identity and business logic through the Core authentication and hook contracts. Flare Social is maintained separately and provides accounts, contacts, group management, and moments. See the [Core governance policy](https://github.com/flare-im/flare-core-server/blob/main/.github/GOVERNANCE.md) for the open-source boundary.
 
-企业场景另有 SSO / 组织架构 / 审计导出 / 数据驻留 / SLA 支持。
+## Repository Scope
 
-咨询：`flare1522@163.com`
-
-> 边界划分与不变承诺见 [GOVERNANCE](https://github.com/flare-im/flare-core-server/blob/main/.github/GOVERNANCE.md)。
-> 简言之：**已开源的不会被收回，鉴权与 hooks 契约永远开源、不会为逼迫付费而阉割。**
+Use this repository for transport and discovery. Start from [the wire contracts](https://github.com/flare-im/flare-protocol) for message encoding or [the Core server](https://github.com/flare-im/flare-core-server) for end-to-end messaging.

@@ -1,6 +1,6 @@
-# Flare Core
+# Flare Transport
 
-[English](README.md) · 中文
+[English](README.md) · 简体中文
 
 > ## ℹ 这是通信基础设施，不是开箱即用的 IM 产品
 >
@@ -293,7 +293,7 @@ crate 级文档为 crates.io 和 docs.rs 保持英文。
 
 | 想做什么 | 去哪里 |
 |---|---|
-| **五分钟跑起来** | [QUICKSTART](https://github.com/flare-im/flare-core-server/blob/main/QUICKSTART.md) —— 起服务、手签 token、调通接口，**不需要自建用户体系** |
+| **五分钟跑起来** | [QUICKSTART](https://github.com/flare-im/flare-core-server/blob/main/docs/QUICKSTART.zh-CN.md) —— 起服务、手签 token、调通接口，**不需要自建用户体系** |
 | 接入自己的用户系统 | 实现 `TokenValidator`（`CoreJwtTokenValidator` 本地验签 / `HttpHookTokenValidator` 调你的接口） |
 | 加自己的业务规则 | `flare-im-hooks` 的 9 个扩展点：PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction / ConversationLifecycle / ConversationMember / GetConversationParticipants |
 | 做界面 | [`@flare-im/vue-ui`](https://www.npmjs.com/package/@flare-im/vue-ui) —— 107 个组件，四端一致的契约 |
@@ -310,3 +310,7 @@ crate 级文档为 crates.io 和 docs.rs 保持英文。
 
 > 边界划分与不变承诺见 [GOVERNANCE](https://github.com/flare-im/flare-core-server/blob/main/.github/GOVERNANCE.md)。
 > 简言之：**已开源的不会被收回，鉴权与 hooks 契约永远开源、不会为逼迫付费而阉割。**
+
+## 仓库职责
+
+本仓负责传输与服务发现。消息编码见[线协议仓](https://github.com/flare-im/flare-protocol)，端到端消息联调从 [Core 服务端](https://github.com/flare-im/flare-core-server) 开始。
