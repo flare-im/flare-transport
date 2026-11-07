@@ -17,6 +17,7 @@
 
 use async_trait::async_trait;
 use flare_core::client::builder::flare::{FlareClient, FlareClientBuilder, MessageListener};
+use flare_core::client::link::DisconnectReason;
 use flare_core::common::config_types::TransportProtocol;
 use flare_core::common::device::{DeviceInfo, DevicePlatform};
 use flare_core::common::error::{ErrorCode, Result};
@@ -109,11 +110,8 @@ impl MessageListener for Recorder {
         Ok(None)
     }
 
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        self.disconnects
-            .lock()
-            .unwrap()
-            .push(reason.unwrap_or_default().to_string());
+    async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
+        self.disconnects.lock().unwrap().push(reason.to_string());
         Ok(())
     }
 }

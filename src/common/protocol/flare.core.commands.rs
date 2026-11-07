@@ -26,9 +26,9 @@ pub mod command {
         Custom(super::CustomCommand),
     }
 }
-/// ---
-///
-/// ## 系统命令
+/// ------------------------------------------------------------
+/// 系统命令
+/// ------------------------------------------------------------
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -39,16 +39,16 @@ pub struct SystemCommand {
     /// 序列化格式（仅 CONNECT/CONNECT_ACK）
     #[prost(enumeration = "system_command::SerializationFormat", tag = "2")]
     pub format: i32,
-    /// 说明信息（ERROR、EVENT、CLOSE、AUTH_ACK）
+    /// 说明信息（ERROR、EVENT、CLOSE、KICKED）
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
-    /// 附加参数（CONNECT、AUTH等）
+    /// 附加参数（CONNECT、CONNECT_ACK、CLOSE、ERROR 等，键见 flare-core constants::metadata_keys）
     #[prost(map = "string, bytes", tag = "4")]
     pub metadata: ::std::collections::HashMap<
         ::prost::alloc::string::String,
         ::prost::alloc::vec::Vec<u8>,
     >,
-    /// 数据载荷（EVENT、AUTH等）
+    /// 数据载荷（EVENT 等）
     #[prost(bytes = "vec", tag = "5")]
     pub data: ::prost::alloc::vec::Vec<u8>,
     /// 压缩算法（仅 CONNECT_ACK，必须是已注册的算法）
@@ -90,10 +90,6 @@ pub mod system_command {
         Error = 6,
         /// 系统事件（需要 message，可选 metadata、data）
         Event = 7,
-        /// 鉴权请求（需要 metadata，可选 data）
-        Auth = 8,
-        /// 鉴权响应（可选 message、metadata）
-        AuthAck = 9,
         /// 被踢下线（需要 message 说明原因，可选 metadata）
         Kicked = 10,
         /// 协商完成确认（客户端收到 CONNECT_ACK 后发送，表示已准备好使用协商好的加密方式）
@@ -114,8 +110,6 @@ pub mod system_command {
                 Self::Pong => "PONG",
                 Self::Error => "ERROR",
                 Self::Event => "EVENT",
-                Self::Auth => "AUTH",
-                Self::AuthAck => "AUTH_ACK",
                 Self::Kicked => "KICKED",
                 Self::NegotiationReady => "NEGOTIATION_READY",
             }
@@ -131,8 +125,6 @@ pub mod system_command {
                 "PONG" => Some(Self::Pong),
                 "ERROR" => Some(Self::Error),
                 "EVENT" => Some(Self::Event),
-                "AUTH" => Some(Self::Auth),
-                "AUTH_ACK" => Some(Self::AuthAck),
                 "KICKED" => Some(Self::Kicked),
                 "NEGOTIATION_READY" => Some(Self::NegotiationReady),
                 _ => None,
@@ -181,9 +173,9 @@ pub mod system_command {
         }
     }
 }
-/// ---
-///
-/// ## 载荷命令（信道层：在信道上传输的四类载荷）
+/// ------------------------------------------------------------
+/// 载荷命令（信道层：在信道上传输的四类载荷）
+/// ------------------------------------------------------------
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -260,9 +252,9 @@ pub mod payload_command {
         }
     }
 }
-/// ---
-///
-/// ## 通知命令
+/// ------------------------------------------------------------
+/// 通知命令
+/// ------------------------------------------------------------
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -337,9 +329,9 @@ pub mod notification_command {
         }
     }
 }
-/// ---
-///
-/// ## 自定义命令
+/// ------------------------------------------------------------
+/// 自定义命令
+/// ------------------------------------------------------------
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, PartialEq, ::prost::Message)]

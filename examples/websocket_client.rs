@@ -7,7 +7,7 @@
 //!
 //! 此示例展示了如何：
 //! 1. 实现 ConnectionObserver trait 来接收消息
-//! 2. 使用 HybridClient::connect_with_config() 直接连接服务器
+//! 2. 使用 HybridClient::connect_with_race() 直接连接服务器
 //! 3. 手动添加观察者和处理连接状态
 
 use flare_core::client::HybridClient;
@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 可选：指定序列化格式（如果不指定，使用服务端默认JSON）
     // .with_format(flare_core::common::protocol::SerializationFormat::Protobuf)
 
-    match HybridClient::connect_with_config(ws_config).await {
+    match HybridClient::connect_with_race(ws_config).await {
         Ok(mut ws_client) => {
             println!("连接成功！");
             println!("使用的协议: {:?}", ws_client.active_protocol());

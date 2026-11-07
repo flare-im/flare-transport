@@ -7,7 +7,7 @@ use crate::client::transports::common::{ClientConnectionHelper, ClientMessageObs
 use crate::client::transports::{Client, ClientCore};
 use crate::common::error::{FlareError, Result};
 use crate::common::generate_id;
-use crate::common::platform::{sleep, timeout};
+use crate::common::platform::timeout;
 use crate::common::protocol::Frame;
 use crate::transport::connection::Connection;
 use crate::transport::events::{ArcObserver, ConnectionEvent};
@@ -26,7 +26,6 @@ pub struct TCPClient {
     connection_prepared: bool,
     connection_id: String,
     core: ClientCore,
-    reconnect_attempts: u32,
 }
 
 impl TCPClient {
@@ -39,7 +38,6 @@ impl TCPClient {
             connection_prepared: false,
             connection_id,
             core,
-            reconnect_attempts: 0,
         }
     }
 
@@ -57,7 +55,6 @@ impl TCPClient {
             connection_prepared: false,
             connection_id,
             core,
-            reconnect_attempts: 0,
         }
     }
 
@@ -90,7 +87,6 @@ impl TCPClient {
 
         self.core
             .handle_connection_event(&ConnectionEvent::Connected);
-        self.reconnect_attempts = 0;
         Ok(())
     }
 
@@ -144,38 +140,6 @@ impl TCPClient {
             .await
     }
 
-    async fn try_reconnect(&mut self) -> Result<()> {
-        if let Some(max) = self.config.max_reconnect_attempts
-            && self.reconnect_attempts >= max
-        {
-            // 回落到可重连状态，避免停在 Connecting 使 can_connect() 恒 false。
-            self.core.state_manager.set_failed();
-            return Err(FlareError::connection_failed(format!(
-                "Max reconnect attempts ({max}) exceeded"
-            )));
-        }
-
-        self.core.state_manager.start_connecting();
-        self.reconnect_attempts += 1;
-        // 上一条连接因服务端停机断开时改为短暂的随机等待
-        sleep(self.core.reconnect_delay(self.config.reconnect_interval)).await;
-
-        self.connection_prepared = false;
-        if let Some(conn) = self.connection.take() {
-            let mut c = conn.lock().await;
-            let _ = c.close().await;
-        }
-
-        // 失败必须回落 Failed，否则卡在 Connecting 无法自愈。
-        match self.internal_connect().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.core.state_manager.set_failed();
-                Err(e)
-            }
-        }
-    }
-
     pub fn core(&self) -> &ClientCore {
         &self.core
     }
@@ -192,25 +156,22 @@ impl Client for TCPClient {
 
         self.core.state_manager.start_connecting();
 
+        // 只连这一次：失败交给上层，由它决定何时、向哪里重连
         match self.internal_connect().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.core.state_manager.set_failed();
-                if ClientConnectionHelper::can_reconnect(self.config.max_reconnect_attempts) {
-                    self.try_reconnect().await
-                } else {
-                    Err(e)
-                }
+                Err(e)
             }
         }
     }
 
-    fn set_disconnect_requested(&mut self, value: bool) {
-        self.core.set_disconnect_requested(value);
+    async fn establish(&mut self) -> Result<()> {
+        self.establish_network_connection().await.map(|_| ())
     }
 
-    fn detach_from_race(&mut self) {
-        self.core.detach_race_state();
+    fn set_disconnect_requested(&mut self, value: bool) {
+        self.core.set_disconnect_requested(value);
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -219,14 +180,6 @@ impl Client for TCPClient {
     }
 
     async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        // 未连接时自己重连（关掉了发送前重连、或我方已主动断开时不重连）
-        if ClientConnectionHelper::should_reconnect_before_send(
-            self.is_connected(),
-            &self.core,
-            &self.config,
-        ) {
-            self.try_reconnect().await?;
-        }
         self.send_frame_internal(frame).await
     }
 

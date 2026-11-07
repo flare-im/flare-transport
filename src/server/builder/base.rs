@@ -66,6 +66,27 @@ impl BaseServerBuilderConfig {
         self
     }
 
+    /// 设置 CONNECT_ACK 里报给客户端的网关实例 ID
+    #[must_use]
+    pub fn with_gateway_id(mut self, gateway_id: impl Into<String>) -> Self {
+        self.config = self.config.with_gateway_id(gateway_id);
+        self
+    }
+
+    /// 设置 CONNECT_ACK 里报给客户端的接入点 ID
+    #[must_use]
+    pub fn with_ap_id(mut self, ap_id: impl Into<String>) -> Self {
+        self.config = self.config.with_ap_id(ap_id);
+        self
+    }
+
+    /// 设置超限拒绝（`OVERLOADED`）里建议客户端等待的基数
+    #[must_use]
+    pub fn with_overload_retry_after(mut self, base: Duration) -> Self {
+        self.config = self.config.with_overload_retry_after(base);
+        self
+    }
+
     /// 设置传输协议
     #[must_use]
     pub fn with_protocol(mut self, protocol: TransportProtocol) -> Self {

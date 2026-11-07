@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tcp()
         .with_user_id(username.clone());
 
-    match HybridClient::connect_with_config(config).await {
+    match HybridClient::connect_with_race(config).await {
         Ok(mut client) => {
             println!("TCP 链路已建立，等待 CONNECT 协商...");
             wait_until_ready(&client, Duration::from_secs(10)).await?;

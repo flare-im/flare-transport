@@ -67,6 +67,24 @@ impl ClientCore {
             metadata.insert("force_format".to_string(), b"true".to_vec());
         }
 
+        // 链路字段：协议版本让服务端在认证之前就能拒绝不兼容的客户端；连接代数与清单 serial
+        // 由上层（链路监督者）每次建连给出，服务端记进连接元数据与日志。
+        use crate::common::constants::metadata_keys;
+        metadata.insert(
+            metadata_keys::PROTOCOL_VERSION.to_string(),
+            crate::common::constants::PROTOCOL_VERSION
+                .as_bytes()
+                .to_vec(),
+        );
+        metadata.insert(
+            metadata_keys::CONNECTION_EPOCH.to_string(),
+            self.config.connection_epoch.to_string().into_bytes(),
+        );
+        metadata.insert(
+            metadata_keys::ACCESS_SERIAL.to_string(),
+            self.config.access_serial.to_string().into_bytes(),
+        );
+
         Self::add_device_metadata(&mut metadata, &self.config);
 
         if let Some(ref user_id) = self.config.user_id {
@@ -350,6 +368,23 @@ mod tests {
         )
         .unwrap();
         assert!(accepted.split(',').any(|name| name == "gzip"), "{accepted}");
+    }
+
+    /// CONNECT 带上协议版本、连接代数与接入清单 serial（都是十进制文本）。
+    #[test]
+    fn build_connect_metadata_carries_the_link_fields() {
+        use crate::common::constants::metadata_keys;
+        let config = sample_config("alice", "secret-token")
+            .with_connection_epoch(7)
+            .with_access_serial(42);
+        let metadata = ClientCore::new(&config).build_connect_metadata();
+        let text = |key: &str| String::from_utf8(metadata[key].clone()).unwrap();
+        assert_eq!(
+            text(metadata_keys::PROTOCOL_VERSION),
+            crate::common::constants::PROTOCOL_VERSION
+        );
+        assert_eq!(text(metadata_keys::CONNECTION_EPOCH), "7");
+        assert_eq!(text(metadata_keys::ACCESS_SERIAL), "42");
     }
 
     #[test]

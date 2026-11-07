@@ -3,13 +3,15 @@
 //! 只处理协议层，连接状态管理、心跳、消息路由等功能委托给 ClientCore
 
 use crate::client::config::ClientConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::client::link::AttemptFailure;
 use crate::client::transports::common::{ClientConnectionHelper, ClientMessageObserver};
 use crate::client::transports::{Client, ClientCore};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::common::cert::create_client_config_with_tls;
 use crate::common::error::{FlareError, Result};
 use crate::common::generate_id;
-use crate::common::platform::{sleep, timeout};
+use crate::common::platform::timeout;
 use crate::common::protocol::Frame;
 use crate::transport::connection::Connection;
 use crate::transport::events::{ArcObserver, ConnectionEvent};
@@ -19,9 +21,15 @@ use crate::transport::websocket::WebSocketTransport;
 use crate::transport::websocket_wasm::WebSocketTransport;
 use async_trait::async_trait;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tokio_tungstenite::tungstenite::{
+    self, client::IntoClientRequest, error::UrlError, handshake::client::Request,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 
 /// WebSocket 客户端
 ///
@@ -34,7 +42,6 @@ pub struct WebSocketClient {
     connection_prepared: bool,
     connection_id: String,
     core: ClientCore,
-    reconnect_attempts: u32,
 }
 
 impl WebSocketClient {
@@ -49,7 +56,6 @@ impl WebSocketClient {
             connection_prepared: false,
             connection_id,
             core,
-            reconnect_attempts: 0,
         }
     }
 
@@ -69,7 +75,6 @@ impl WebSocketClient {
             connection_prepared: false,
             connection_id,
             core,
-            reconnect_attempts: 0,
         }
     }
 
@@ -109,7 +114,6 @@ impl WebSocketClient {
         // 通知连接成功
         self.core
             .handle_connection_event(&ConnectionEvent::Connected);
-        self.reconnect_attempts = 0;
 
         Ok(())
     }
@@ -128,15 +132,12 @@ impl WebSocketClient {
                 .max_message_size(Some(10 * 1024 * 1024))
                 .max_frame_size(Some(10 * 1024 * 1024));
             let tls_connector = self.tls_connector(&url_str)?;
-            let ws_stream_result = timeout(
+            let ws_stream = timeout(
                 self.config.connect_timeout,
-                connect_async_tls_with_config(&url_str, Some(ws_config), false, tls_connector),
+                self.dial_websocket(&url_str, ws_config, tls_connector),
             )
             .await
-            .map_err(|_| FlareError::connection_timeout("Connection timeout".to_string()))?;
-
-            let (ws_stream, _) =
-                ws_stream_result.map_err(|e| FlareError::connection_failed(e.to_string()))?;
+            .map_err(|_| FlareError::connection_timeout("Connection timeout".to_string()))??;
 
             let transport = WebSocketTransport::new(ws_stream);
             Ok(Box::new(transport))
@@ -152,6 +153,58 @@ impl WebSocketClient {
             .map_err(|_| FlareError::connection_timeout("Connection timeout".to_string()))??;
             Ok(Box::new(transport))
         }
+    }
+
+    /// 建 TCP、做 TLS、升级 WebSocket。TCP 连到 `crate::client::dial` 选出的地址，TLS 和升级请求
+    /// 都按 URL：SNI、证书校验和钉扎用的是主机名，不是实际连上的 IP。
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn dial_websocket(
+        &self,
+        url: &str,
+        ws_config: tungstenite::protocol::WebSocketConfig,
+        tls_connector: Option<Connector>,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let request = url
+            .into_client_request()
+            .map_err(|e| FlareError::connection_failed(e.to_string()))?;
+        let (host, port) = dial_endpoint(&request)?;
+        let dial = async {
+            let stream = crate::client::dial::connect_tcp(
+                &host,
+                port,
+                &self.config.ip_hints,
+                self.config.doh.as_ref(),
+                self.config.connect_timeout,
+            )
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut => FlareError::connection_timeout(e.to_string()),
+                _ => FlareError::connection_failed(e.to_string()),
+            })?;
+            let (ws_stream, _) =
+                client_async_tls_with_config(request, stream, Some(ws_config), tls_connector)
+                    .await
+                    .map_err(|e| {
+                        let error = FlareError::connection_failed(e.to_string());
+                        if let Some(doh) = &self.config.doh
+                            && matches!(
+                                AttemptFailure::from_establish_error(&error),
+                                AttemptFailure::Tls { .. }
+                            )
+                        {
+                            doh.tls_failed(&host);
+                        }
+                        error
+                    })?;
+            Ok(ws_stream)
+        };
+        crate::client::dial::watch_dial(
+            &host,
+            self.config.doh.as_ref(),
+            self.config.connect_timeout,
+            dial,
+        )
+        .await
     }
 
     /// 设置连接和观察者
@@ -180,45 +233,6 @@ impl WebSocketClient {
     async fn send_frame_internal(&self, frame: &Frame) -> Result<()> {
         ClientConnectionHelper::send_frame_internal(&self.core, self.connection.as_ref(), frame)
             .await
-    }
-
-    /// 尝试重连
-    async fn try_reconnect(&mut self) -> Result<()> {
-        // 检查重连次数限制
-        if let Some(max) = self.config.max_reconnect_attempts
-            && self.reconnect_attempts >= max
-        {
-            // 回落到可重连状态：否则若此前停在 Connecting，can_connect() 恒 false。
-            self.core.state_manager.set_failed();
-            return Err(FlareError::connection_failed(format!(
-                "Max reconnect attempts ({}) exceeded",
-                max
-            )));
-        }
-
-        self.core.state_manager.start_connecting();
-        self.reconnect_attempts += 1;
-
-        // 等待重连间隔；上一条连接因服务端停机断开时改为短暂的随机等待
-        sleep(self.core.reconnect_delay(self.config.reconnect_interval)).await;
-
-        // 关闭旧连接
-        self.connection_prepared = false;
-        if let Some(conn) = self.connection.take() {
-            let mut c = conn.lock().await;
-            let _ = c.close().await;
-        }
-
-        // 执行连接：失败必须把状态回落到 Failed，否则卡在 Connecting，
-        // can_connect() 恒 false，后续发送全部报 "Cannot connect: state is unavailable"
-        // 无法自愈（服务端恢复后也只能靠刷新页面）。
-        match self.internal_connect().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.core.state_manager.set_failed();
-                Err(e)
-            }
-        }
     }
 
     /// 获取 ClientCore（用于外部访问）
@@ -278,6 +292,28 @@ impl WebSocketClient {
     }
 }
 
+/// 请求 URL 里要拨的主机与端口。IPv6 字面量去掉方括号，解析器不认带方括号的写法。
+#[cfg(not(target_arch = "wasm32"))]
+fn dial_endpoint(request: &Request) -> Result<(String, u16)> {
+    let url_error =
+        |error| FlareError::connection_failed(tungstenite::Error::Url(error).to_string());
+    let uri = request.uri();
+    let host = uri.host().ok_or_else(|| url_error(UrlError::NoHostName))?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = uri
+        .port_u16()
+        .or(match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or_else(|| url_error(UrlError::UnsupportedUrlScheme))?;
+    Ok((host.to_owned(), port))
+}
+
 #[cfg(target_arch = "wasm32")]
 unsafe impl Send for WebSocketClient {}
 #[cfg(target_arch = "wasm32")]
@@ -289,7 +325,7 @@ mod tests {
     use crate::common::config_types::TlsConfig;
     use std::path::PathBuf;
 
-    /// 主动断开后，发送不能把客户端自动重连起来（登出/换号后旧会话的在途发送不得复活旧连接）。
+    /// 客户端不自己重连：断开后的发送直接失败，不去拨号。
     #[tokio::test]
     async fn send_after_requested_disconnect_does_not_reconnect() {
         let config = ClientConfig::new("ws://127.0.0.1:9/ws".to_string()).websocket();
@@ -305,8 +341,26 @@ mod tests {
         );
         let started = std::time::Instant::now();
         assert!(client.send_frame(&ping).await.is_err());
-        assert_eq!(client.reconnect_attempts, 0, "must not try to reconnect");
+        assert!(client.connection.is_none(), "must not dial again");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dial_endpoint_reads_host_and_port_from_the_url() {
+        let endpoint = |url: &str| dial_endpoint(&url.into_client_request().unwrap()).unwrap();
+        assert_eq!(
+            endpoint("wss://ap-1.example.com/ws"),
+            ("ap-1.example.com".to_string(), 443)
+        );
+        assert_eq!(
+            endpoint("ws://ap-1.example.com/ws"),
+            ("ap-1.example.com".to_string(), 80)
+        );
+        assert_eq!(
+            endpoint("wss://ap-1.example.com:8443/ws"),
+            ("ap-1.example.com".to_string(), 8443)
+        );
+        assert_eq!(endpoint("ws://[::1]:8080/ws"), ("::1".to_string(), 8080));
     }
 
     #[test]
@@ -348,27 +402,22 @@ impl Client for WebSocketClient {
 
         self.core.state_manager.start_connecting();
 
+        // 只连这一次：失败交给上层，由它决定何时、向哪里重连
         match self.internal_connect().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.core.state_manager.set_failed();
-                // 如果允许重连，尝试重连
-                if ClientConnectionHelper::can_reconnect(self.config.max_reconnect_attempts) {
-                    self.try_reconnect().await
-                } else {
-                    Err(e)
-                }
+                Err(e)
             }
         }
     }
 
-    fn set_disconnect_requested(&mut self, value: bool) {
-        self.core.set_disconnect_requested(value);
+    async fn establish(&mut self) -> Result<()> {
+        self.establish_network_connection().await.map(|_| ())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn detach_from_race(&mut self) {
-        self.core.detach_race_state();
+    fn set_disconnect_requested(&mut self, value: bool) {
+        self.core.set_disconnect_requested(value);
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -377,15 +426,6 @@ impl Client for WebSocketClient {
     }
 
     async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        // 未连接时自己重连（关掉了发送前重连、或我方已主动断开时不重连）
-        if ClientConnectionHelper::should_reconnect_before_send(
-            self.is_connected(),
-            &self.core,
-            &self.config,
-        ) {
-            self.try_reconnect().await?;
-        }
-
         self.send_frame_internal(frame).await
     }
 

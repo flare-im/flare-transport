@@ -442,6 +442,7 @@ impl ConnectionHandlerObserverAdapter {
                     crate::common::error::ErrorCode::AuthenticationFailed
                         | crate::common::error::ErrorCode::PermissionDenied
                         | crate::common::error::ErrorCode::ServiceUnavailable
+                        | crate::common::error::ErrorCode::ProtocolVersionMismatch
                 )
             ) {
                 warn!(

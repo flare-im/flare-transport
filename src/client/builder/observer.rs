@@ -142,21 +142,9 @@ impl ObserverClientBuilder {
         self
     }
 
-    /// 设置重连间隔
-    pub fn with_reconnect_interval(mut self, interval: std::time::Duration) -> Self {
-        self.base = self.base.with_reconnect_interval(interval);
-        self
-    }
-
-    /// 设置最大重连次数
-    pub fn with_max_reconnect_attempts(mut self, max: Option<u32>) -> Self {
-        self.base = self.base.with_max_reconnect_attempts(max);
-        self
-    }
-
-    /// 设置断开后发送时是否由客户端自己重连（默认 `true`）
-    pub fn with_reconnect_on_send(mut self, enabled: bool) -> Self {
-        self.base = self.base.with_reconnect_on_send(enabled);
+    /// 设置交错竞速的间隔（上一个协议这么久还没完成握手就发起下一个，默认 300 ms）
+    pub fn with_race_stagger(mut self, stagger: std::time::Duration) -> Self {
+        self.base = self.base.with_race_stagger(stagger);
         self
     }
 
@@ -180,27 +168,27 @@ impl ObserverClientBuilder {
         self
     }
 
-    /// 构建客户端（使用协议竞速）
+    /// 交错竞速建连后返回客户端（返回时已经收到 CONNECT_ACK）。
+    ///
+    /// 观察者在收到 CONNECT_ACK 时挂到胜出的连接上，落败连接的事件到不了它。失败时错误里是服务端
+    /// 拒绝的类别，或各协议的失败汇总（类型化的结果见 [`HybridClient::connect_with_race`]）。
     pub async fn build_with_race(self) -> Result<ObserverClient> {
         let observer = self.observer.ok_or_else(|| {
             crate::common::error::FlareError::general_error("Observer is required")
         })?;
 
-        let client = HybridClient::connect_with_race(self.base.config).await?;
-        let wrapper = ClientWrapper::new(client);
-
-        // 设置事件处理器（如果提供）
+        let mut client = HybridClient::new(self.base.config)?;
         if let Some(event_handler) = self.event_handler {
-            wrapper.set_event_handler(Some(event_handler)).await;
+            client.core_mut().set_event_handler(Some(event_handler));
         }
-
-        wrapper
-            .add_observer(Arc::clone(&observer) as Arc<dyn ConnectionObserver>)
-            .await;
+        client
+            .core()
+            .add_observer(Arc::clone(&observer) as Arc<dyn ConnectionObserver>);
+        crate::client::Client::connect(&mut client).await?;
 
         Ok(ObserverClient {
-            wrapper,
-            observer: Some(observer),
+            wrapper: ClientWrapper::new(client),
+            observer: None,
         })
     }
 

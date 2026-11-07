@@ -25,6 +25,9 @@ const METADATA_SYSTEM_VERSION: &str = "system_version";
 const METADATA_USER_ID: &str = "user_id";
 const METADATA_TENANT_ID: &str = crate::server::auth::TENANT_ID_METADATA_KEY;
 const METADATA_FORCE_FORMAT: &str = "force_format";
+const METADATA_PROTOCOL_VERSION: &str = crate::common::constants::metadata_keys::PROTOCOL_VERSION;
+const METADATA_CONNECTION_EPOCH: &str = crate::common::constants::metadata_keys::CONNECTION_EPOCH;
+const METADATA_ACCESS_SERIAL: &str = crate::common::constants::metadata_keys::ACCESS_SERIAL;
 
 const DEVICE_RESERVED_METADATA_KEYS: &[&str] = &[
     METADATA_COMPRESSION,
@@ -66,6 +69,12 @@ pub struct NegotiationResult {
     /// 这是客户端的自报值，只在未启用认证时作为连接租户；启用认证时一律以认证结果中的租户为准，
     /// 不会采信这里的值。
     pub tenant_id: Option<String>,
+    /// 客户端说的协议版本（metadata `protocol_version`）；没带时为 `None`
+    pub protocol_version: Option<String>,
+    /// 客户端连接代数（metadata `connection_epoch`），只用于日志与诊断
+    pub connection_epoch: Option<u64>,
+    /// 客户端当前接入清单 serial（metadata `access_serial`），只用于日志与诊断
+    pub access_serial: Option<u64>,
 }
 
 impl Default for NegotiationResult {
@@ -80,6 +89,9 @@ impl Default for NegotiationResult {
             device_info: None,
             user_id: None,
             tenant_id: None,
+            protocol_version: None,
+            connection_epoch: None,
+            access_serial: None,
         }
     }
 }
@@ -113,6 +125,11 @@ pub fn parse_connect_message(frame: &Frame) -> Result<NegotiationResult> {
         device_info: parse_device_info(metadata),
         user_id: metadata_string(metadata, METADATA_USER_ID),
         tenant_id: metadata_string(metadata, METADATA_TENANT_ID),
+        protocol_version: metadata_string(metadata, METADATA_PROTOCOL_VERSION)
+            .map(|version| version.trim().to_string())
+            .filter(|version| !version.is_empty()),
+        connection_epoch: metadata_u64(metadata, METADATA_CONNECTION_EPOCH),
+        access_serial: metadata_u64(metadata, METADATA_ACCESS_SERIAL),
     };
 
     Ok(result)
@@ -202,6 +219,10 @@ fn parse_device_info(metadata: &HashMap<String, Vec<u8>>) -> Option<DeviceInfo> 
 
 fn metadata_string(metadata: &HashMap<String, Vec<u8>>, key: &str) -> Option<String> {
     metadata.get(key).and_then(|value| bytes_to_string(value))
+}
+
+fn metadata_u64(metadata: &HashMap<String, Vec<u8>>, key: &str) -> Option<u64> {
+    metadata_string(metadata, key).and_then(|value| value.trim().parse().ok())
 }
 
 fn bytes_to_string(value: &[u8]) -> Option<String> {
@@ -361,6 +382,33 @@ mod tests {
         );
         let device = result.device_info.expect("device info");
         assert!(!device.metadata.contains_key(METADATA_ACCEPT_COMPRESSION));
+    }
+
+    /// 协议版本、连接代数、清单 serial 读进协商结果；设备元数据里照样留一份，网关按需记录。
+    #[test]
+    fn parses_link_fields_from_connect_metadata() {
+        let metadata = HashMap::from([
+            (METADATA_PROTOCOL_VERSION.to_string(), b" 1.0.0 ".to_vec()),
+            (METADATA_CONNECTION_EPOCH.to_string(), b"7".to_vec()),
+            (METADATA_ACCESS_SERIAL.to_string(), b"42".to_vec()),
+            (METADATA_DEVICE_ID.to_string(), b"device-1".to_vec()),
+        ]);
+        let frame = frame_with_system_command(
+            connect(SerializationFormat::Json, metadata),
+            Reliability::AtLeastOnce,
+        );
+        let result = parse_connect_message(&frame).expect("parse connect");
+        assert_eq!(result.protocol_version.as_deref(), Some("1.0.0"));
+        assert_eq!(result.connection_epoch, Some(7));
+        assert_eq!(result.access_serial, Some(42));
+
+        let bare = frame_with_system_command(
+            connect(SerializationFormat::Json, HashMap::new()),
+            Reliability::AtLeastOnce,
+        );
+        let result = parse_connect_message(&bare).expect("parse connect");
+        assert_eq!(result.protocol_version, None);
+        assert_eq!(result.connection_epoch, None);
     }
 
     #[test]

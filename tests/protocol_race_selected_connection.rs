@@ -1,18 +1,17 @@
-//! 协议竞速（QUIC + WebSocket）选出连接之后，这条连接上的事件原样交给上层，未选中的连接不留下任何影响。
+//! 交错竞速（QUIC 在前、WebSocket 在后）选出连接之后，这条连接上的事件原样交给上层，未选中的连接
+//! 不留下任何影响。
 //!
 //! 本机回环（只绑 127.0.0.1）起真实的 flare-core 服务端，客户端走 `FlareClientBuilder::build_with_race`，
 //! 与 IM SDK 在原生端、Tauri 上的默认建连路径相同（同时配了 ws_url 与 quic_url）。
 //!
 //! - QUIC 不可达、WebSocket 胜出：选中的 WebSocket 连接以协议错误终止（经 TCP 中继注入非法帧），
-//!   监听器必须收到这个错误。此前 `FlareObserver` 在竞速模式下按文本把它当作关闭未选中连接的正常错误
-//!   吞掉，关掉了发送前重连的上层（IM SDK）收不到断开也收不到错误，停在一条死连接上。
-//! - 两个协议都可达：竞速收尾时关掉的那条连接把「我方已主动断开」置在了共享标记上，选中的连接此后
-//!   一直带着它，被服务端断开后发送前不再重连（"client was disconnected on request"）。
-//! - UDP 被静默丢弃（QUIC 端口是只收不回的黑洞）、WebSocket 正常：WebSocket 一建好就胜出，竞速不等
-//!   还在握手的 QUIC。此前竞速要等 QUIC 握手到连接超时（默认 30 s）才收尾，在竞速时限（默认 5 s）处
-//!   整体失败，已经连上的 WebSocket 也一起丢掉；胜出的 WebSocket 还会在发 CONNECT 前重新拨号一次。
-//! - 两个协议都连不上（QUIC 黑洞，WebSocket 端口只接受不应答）：竞速在竞速时限处失败，不等握手到
-//!   连接超时。
+//!   监听器必须收到以传输错误为原因的断开。
+//! - 两个协议都可达：首选 QUIC 在交错间隔内就完成握手，服务端只看到一条连接，WebSocket 根本不发起；
+//!   服务端断开它之后客户端不自己重连，发送直接报未连接。
+//! - UDP 被静默丢弃（QUIC 端口是只收不回的黑洞）、WebSocket 正常：交错间隔一到就发起 WebSocket 并经它
+//!   连上，不等 QUIC 握手超时；竞速建好的那条 WebSocket 连接直接用来发 CONNECT，不重新拨号。
+//! - 两个协议都连不上（QUIC 黑洞，WebSocket 端口只接受不应答）：各自在单次握手时限处失败，两个协议的
+//!   失败类别都带回。
 
 #![cfg(all(
     feature = "client",
@@ -24,6 +23,7 @@
 
 use async_trait::async_trait;
 use flare_core::client::builder::flare::{FlareClient, FlareClientBuilder, MessageListener};
+use flare_core::client::link::{AttemptFailure, DisconnectReason};
 use flare_core::common::cert::{SERVER_CERT_ENV, SERVER_KEY_ENV};
 use flare_core::common::config_types::{TlsConfig, TransportProtocol};
 use flare_core::common::device::{DeviceInfo, DevicePlatform};
@@ -135,16 +135,11 @@ impl MessageListener for Recorder {
         Ok(None)
     }
 
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        self.disconnects
-            .lock()
-            .unwrap()
-            .push(reason.unwrap_or_default().to_string());
-        Ok(())
-    }
-
-    async fn on_error(&self, error: &str) -> Result<()> {
-        self.errors.lock().unwrap().push(error.to_string());
+    async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
+        if let DisconnectReason::TransportError { detail } = reason {
+            self.errors.lock().unwrap().push(detail.clone());
+        }
+        self.disconnects.lock().unwrap().push(reason.to_string());
         Ok(())
     }
 }
@@ -273,8 +268,8 @@ impl Relay {
     }
 }
 
-/// QUIC 不可达（UDP 端口上没有服务），WebSocket 胜出。选中的 WebSocket 连接
-/// 以协议错误终止时，监听器收到这个错误；此前竞速模式下它被当作未选中连接的关闭错误吞掉。
+/// QUIC 不可达（UDP 端口上没有服务），WebSocket 胜出。选中的 WebSocket 连接以协议错误终止时，
+/// 监听器收到以传输错误为原因的断开。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_protocol_error_on_the_selected_websocket_connection_reaches_the_listener() {
     let ws_port = free_tcp_port();
@@ -286,7 +281,6 @@ async fn a_protocol_error_on_the_selected_websocket_connection_reaches_the_liste
         format!("quic://127.0.0.1:{}", free_udp_port()),
         recorder.clone(),
     )
-    .with_reconnect_on_send(false)
     .build_with_race()
     .await
     .expect("the race selects WebSocket");
@@ -315,11 +309,10 @@ async fn a_protocol_error_on_the_selected_websocket_connection_reaches_the_liste
     server.stop().await.expect("stop server");
 }
 
-/// 两个协议都可达：竞速收尾时关掉的那条连接不能把「我方已主动断开」留给选中的连接。服务端断开
-/// 选中的连接之后，下一次发送照常重连（发送前重连默认开着）。此前它报
-/// "client was disconnected on request; not reconnecting"。
+/// 两个协议都可达：首选 QUIC 在交错间隔内完成握手，服务端只看到这一条连接，WebSocket 根本没有发起。
+/// 服务端断开它之后客户端不自己重连：发送直接报未连接，重连由上层新建客户端完成。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn closing_the_race_loser_does_not_mark_the_selected_connection_as_closed_on_request() {
+async fn a_fast_first_choice_is_the_only_connection_and_is_not_revived() {
     let ws_port = free_tcp_port();
     let quic_port = free_udp_port();
     let server = start_server(ws_port, Some(quic_port)).await;
@@ -333,6 +326,11 @@ async fn closing_the_race_loser_does_not_mark_the_selected_connection_as_closed_
     .build_with_race()
     .await
     .expect("the race selects a protocol");
+    let report = client.connect_report().clone();
+    assert_eq!(report.protocol, TransportProtocol::QUIC, "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(report.cancelled.is_empty(), "{report:?}");
+    assert!(report.ack.server_time_ms.is_some(), "{report:?}");
     wait_until("CONNECT_ACK", Duration::from_secs(3), || async {
         recorder.acks() == 1
     })
@@ -343,11 +341,11 @@ async fn closing_the_race_loser_does_not_mark_the_selected_connection_as_closed_
         .expect("connection manager")
         .list_connections()
         .await;
-    assert!(!connections.is_empty());
-    // 未选中的连接若还在表里，一并断开也无妨：它在客户端一侧已经关了
-    for connection_id in &connections {
-        let _ = server.disconnect(connection_id).await;
-    }
+    assert_eq!(connections.len(), 1, "only the first choice connected");
+    server
+        .disconnect(&connections[0])
+        .await
+        .expect("disconnect the client");
     wait_until(
         "the client notices the close",
         Duration::from_secs(3),
@@ -355,17 +353,16 @@ async fn closing_the_race_loser_does_not_mark_the_selected_connection_as_closed_
     )
     .await;
 
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        client.send_frame(&frame_with_system_command(ping(), Reliability::AtLeastOnce)),
-    )
-    .await
-    .expect("send after the server close must not hang")
-    .expect("send after the server close reconnects");
-    wait_until("second CONNECT_ACK", Duration::from_secs(3), || async {
-        recorder.acks() == 2
-    })
-    .await;
+    let error = client
+        .send_frame(&frame_with_system_command(ping(), Reliability::AtLeastOnce))
+        .await
+        .expect_err("the client does not reconnect on its own");
+    assert_eq!(
+        error.code(),
+        Some(flare_core::common::error::ErrorCode::NotConnected),
+        "{error}"
+    );
+    assert_eq!(recorder.acks(), 1);
 
     let _ = client.disconnect().await;
     server.stop().await.expect("stop server");
@@ -433,12 +430,9 @@ impl SilentTcp {
     }
 }
 
-/// UDP 被静默丢弃（QUIC 端口是黑洞）、WebSocket 正常，连接超时与竞速时限都用默认值（30 s、5 s）：
-/// WebSocket 一建好就胜出，竞速在有界时间内经 WebSocket 连上，不等还在握手的 QUIC；竞速建好的那条
-/// WebSocket 连接直接用来发 CONNECT，不重新拨号。
-///
-/// 此前竞速等 QUIC 握手到连接超时才收尾，在竞速时限处以「Protocol race timed out after 5s」整体失败，
-/// 已经连上的 WebSocket 也一起丢掉；原生端与 Tauri 在屏蔽 UDP 的网络里一直连不上。
+/// UDP 被静默丢弃（QUIC 端口是黑洞）、WebSocket 正常，交错间隔与单次握手时限都用默认值（300 ms、8 s）：
+/// 间隔一到就发起 WebSocket 并经它连上，不等 QUIC 握手超时；QUIC 记为被取消（不算失败）。竞速建好的
+/// 那条 WebSocket 连接直接用来发 CONNECT，不重新拨号。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_race_connects_over_websocket_at_once_when_udp_is_silently_dropped() {
     let ws_port = free_tcp_port();
@@ -462,6 +456,13 @@ async fn the_race_connects_over_websocket_at_once_when_udp_is_silently_dropped()
         "the race must not wait for the unselected QUIC handshake: took {elapsed:?}"
     );
     assert_eq!(client.active_protocol(), TransportProtocol::WebSocket);
+    let cancelled = &client.connect_report().cancelled;
+    assert_eq!(cancelled.len(), 1, "{cancelled:?}");
+    assert_eq!(cancelled[0].protocol, TransportProtocol::QUIC);
+    assert!(
+        !cancelled[0].transport_ready,
+        "the black-holed QUIC never came up: {cancelled:?}"
+    );
     wait_until("CONNECT_ACK", Duration::from_secs(3), || async {
         recorder.acks() == 1
     })
@@ -490,10 +491,10 @@ async fn the_race_connects_over_websocket_at_once_when_udp_is_silently_dropped()
     server.stop().await.expect("stop server");
 }
 
-/// 两个协议都连不上（QUIC 端口是黑洞，WebSocket 端口只接受不应答），连接超时 10 s、竞速时限 1 s：
-/// 竞速在竞速时限处失败，不等还在握手的连接收尾到连接超时。
+/// 两个协议都连不上（QUIC 端口是黑洞，WebSocket 端口只接受不应答），单次握手时限 1 s：QUIC 先发起、
+/// 间隔后发起 WebSocket，各自在时限处失败，两个协议的失败类别（传输建立超时）都带回。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_race_without_a_reachable_protocol_fails_at_the_race_timeout() {
+async fn a_race_without_a_reachable_protocol_reports_every_timeout() {
     let blackhole = UdpBlackhole::start().await;
     let silent = SilentTcp::start().await;
     let recorder = Arc::new(Recorder::default());
@@ -504,22 +505,28 @@ async fn a_race_without_a_reachable_protocol_fails_at_the_race_timeout() {
         format!("quic://{}", blackhole.address),
         recorder,
     )
-    .with_connect_timeout(Duration::from_secs(10))
-    .with_race_timeout(Duration::from_secs(1))
+    .with_connect_timeout(Duration::from_secs(1))
     .build_with_race()
     .await;
     let elapsed = started.elapsed();
-    let error = match result {
+    let failure = match result {
         Ok(_) => panic!("neither protocol is reachable"),
-        Err(error) => error.to_string(),
+        Err(failure) => failure,
     };
-    assert!(
-        error.contains("Protocol race timed out"),
-        "unexpected error: {error}"
+    assert_eq!(failure.attempts.len(), 2, "{failure}");
+    assert_eq!(
+        failure.failure_of(TransportProtocol::QUIC),
+        Some(&AttemptFailure::Timeout),
+        "{failure}"
+    );
+    assert_eq!(
+        failure.failure_of(TransportProtocol::WebSocket),
+        Some(&AttemptFailure::Timeout),
+        "{failure}"
     );
     assert!(
         elapsed < Duration::from_millis(2_500),
-        "the race must fail at its own timeout, not after the handshakes time out: took {elapsed:?}"
+        "each protocol fails at its own handshake limit: took {elapsed:?}"
     );
 
     blackhole.stop();

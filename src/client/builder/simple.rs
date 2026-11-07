@@ -264,21 +264,9 @@ impl ClientBuilder {
         self
     }
 
-    /// 设置重连间隔
-    pub fn with_reconnect_interval(mut self, interval: std::time::Duration) -> Self {
-        self.base = self.base.with_reconnect_interval(interval);
-        self
-    }
-
-    /// 设置最大重连次数
-    pub fn with_max_reconnect_attempts(mut self, max: Option<u32>) -> Self {
-        self.base = self.base.with_max_reconnect_attempts(max);
-        self
-    }
-
-    /// 设置断开后发送时是否由客户端自己重连（默认 `true`）
-    pub fn with_reconnect_on_send(mut self, enabled: bool) -> Self {
-        self.base = self.base.with_reconnect_on_send(enabled);
+    /// 设置交错竞速的间隔（上一个协议这么久还没完成握手就发起下一个，默认 300 ms）
+    pub fn with_race_stagger(mut self, stagger: std::time::Duration) -> Self {
+        self.base = self.base.with_race_stagger(stagger);
         self
     }
 

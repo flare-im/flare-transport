@@ -31,6 +31,8 @@ pub struct AuthResult {
     /// 不能报成鉴权失败或租户不可用，否则客户端会去换令牌或终止会话。见
     /// [`AuthResult::retryable_failure`]。
     pub retryable: bool,
+    /// 这条连接所属应用的最新接入清单 serial，随 CONNECT_ACK 下发；0 表示服务端不知道
+    pub access_serial: u64,
 }
 
 impl AuthResult {
@@ -42,6 +44,7 @@ impl AuthResult {
             error_message: None,
             user_metadata: None,
             retryable: false,
+            access_serial: 0,
         }
     }
 
@@ -56,6 +59,7 @@ impl AuthResult {
             error_message: None,
             user_metadata: Some(metadata),
             retryable: false,
+            access_serial: 0,
         }
     }
 
@@ -67,6 +71,7 @@ impl AuthResult {
             error_message: Some(error_message),
             user_metadata: None,
             retryable: false,
+            access_serial: 0,
         }
     }
 
@@ -88,6 +93,13 @@ impl AuthResult {
         self.user_metadata
             .get_or_insert_with(Default::default)
             .insert(TENANT_ID_METADATA_KEY.to_string(), tenant_id.into());
+        self
+    }
+
+    /// 写入这条连接要在 CONNECT_ACK 里看到的接入清单 serial
+    #[must_use]
+    pub fn with_access_serial(mut self, access_serial: u64) -> Self {
+        self.access_serial = access_serial;
         self
     }
 

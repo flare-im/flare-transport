@@ -148,12 +148,9 @@ ClientBuilder::new("ws://127.0.0.1:8080")
     // 心跳配置
     .with_heartbeat(HeartbeatConfig::default())
 
-    // 连接配置
-    .with_connect_timeout(Duration::from_secs(10))
-    .with_reconnect_interval(Duration::from_secs(3))
-    .with_max_reconnect_attempts(Some(5))
-    // 断开后发送前由客户端自己重连（默认）；上层自带重连循环时置 false
-    .with_reconnect_on_send(true)
+    // 连接配置：单个协议一次握手（传输建立 + CONNECT_ACK）的时限、交错竞速间隔
+    .with_connect_timeout(Duration::from_secs(8))
+    .with_race_stagger(Duration::from_millis(300))
 
     // TLS 配置（QUIC 需要）
     .with_tls(TlsConfig::default())
@@ -389,18 +386,9 @@ impl MessageListener for MyListener {
         Ok(None)
     }
 
-    async fn on_connect(&self) -> Result<()> {
-        println!("已连接");
-        Ok(())
-    }
-
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        println!("连接断开: {:?}", reason);
-        Ok(())
-    }
-
-    async fn on_error(&self, error: &str) -> Result<()> {
-        eprintln!("错误: {}", error);
+    // 连接结束（对端关闭、读写出错、心跳判死、被踢、计划性关闭、主动断开）都走这里
+    async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
+        println!("连接断开: {reason}");
         Ok(())
     }
 }
@@ -529,12 +517,9 @@ let client = FlareClientBuilder::new("ws://127.0.0.1:8080")
         .with_interval(Duration::from_secs(30))
         .with_timeout(Duration::from_secs(90)))
 
-    // 连接配置
-    .with_connect_timeout(Duration::from_secs(10))
-    .with_reconnect_interval(Duration::from_secs(3))
-    .with_max_reconnect_attempts(Some(5))
-    // 断开后发送前由客户端自己重连（默认）；上层自带重连循环时置 false
-    .with_reconnect_on_send(true)
+    // 连接配置：单个协议一次握手（传输建立 + CONNECT_ACK）的时限、交错竞速间隔
+    .with_connect_timeout(Duration::from_secs(8))
+    .with_race_stagger(Duration::from_millis(300))
 
     // TLS 配置（QUIC 需要）
     .with_tls(TlsConfig::default())
@@ -554,8 +539,8 @@ let client = FlareClientBuilder::new("ws://127.0.0.1:8080")
 2. **压缩协商**：自动协商压缩算法（Gzip/Zstd/None）
 3. **加密协商**：自动协商加密方式（AES-256-GCM/None）
 4. **心跳检测**：自动发送心跳并检测连接健康状态
-5. **自动重连**：连接断开后，下一次发送前自动重连（如果配置）。上层自带重连循环时用
-   `with_reconnect_on_send(false)` 关掉，未连接时发送直接返回 `NOT_CONNECTED`，重连只走上层一条路径
+5. **不自己重连**：连接断开后以类型化原因（`DisconnectReason`）回调 `on_disconnect`，未连接时发送直接
+   返回 `NOT_CONNECTED`；何时、向哪里重连由上层决定（新建客户端）
 6. **消息解析**：根据协商结果自动解析消息
 
 ### 扩展能力

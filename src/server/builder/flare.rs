@@ -155,6 +155,24 @@ impl FlareServerBuilder {
         self
     }
 
+    /// 设置 CONNECT_ACK 里报给客户端的网关实例 ID（诊断用）
+    pub fn with_gateway_id(mut self, gateway_id: impl Into<String>) -> Self {
+        self.base = self.base.with_gateway_id(gateway_id);
+        self
+    }
+
+    /// 设置 CONNECT_ACK 里报给客户端的接入点 ID（诊断用）
+    pub fn with_ap_id(mut self, ap_id: impl Into<String>) -> Self {
+        self.base = self.base.with_ap_id(ap_id);
+        self
+    }
+
+    /// 设置握手并发或连接数超限时 `OVERLOADED` 拒绝里建议客户端等待的基数（再加 0–50% 抖动）
+    pub fn with_overload_retry_after(mut self, base: std::time::Duration) -> Self {
+        self.base = self.base.with_overload_retry_after(base);
+        self
+    }
+
     // ============================================================
     // 配置方法（委托给 BaseServerBuilderConfig）
     // ============================================================

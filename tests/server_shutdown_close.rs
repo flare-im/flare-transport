@@ -1,4 +1,5 @@
-//! 服务端停机时先告诉在线连接原因，客户端据此断开并在短暂的随机等待后重连。
+//! 服务端停机时先告诉在线连接原因与重连窗口，客户端据此断开，把类型化原因（带窗口）交给上层；
+//! 何时重连由上层按窗口决定，客户端自己不重连。
 //!
 //! 本机回环（只绑 127.0.0.1）起一个真实的 flare-core WebSocket 服务端。复现的是 W6-S2 的 F5：
 //! core 停机时 WebSocket 以 1005（没有状态码）关闭，关闭前没有带原因的系统帧，客户端分不清停机
@@ -13,6 +14,7 @@
 
 use async_trait::async_trait;
 use flare_core::client::builder::flare::{FlareClient, FlareClientBuilder, MessageListener};
+use flare_core::client::link::{CloseKind, DisconnectReason};
 use flare_core::common::config_types::TransportProtocol;
 use flare_core::common::device::{DeviceInfo, DevicePlatform};
 use flare_core::common::error::Result;
@@ -77,6 +79,7 @@ struct Recorder {
     acks: AtomicUsize,
     shutdown_close: AtomicBool,
     disconnects: Mutex<Vec<String>>,
+    typed: Mutex<Vec<DisconnectReason>>,
     errors: Mutex<Vec<String>>,
 }
 
@@ -106,22 +109,15 @@ impl MessageListener for Recorder {
         Ok(None)
     }
 
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        self.disconnects
-            .lock()
-            .unwrap()
-            .push(reason.unwrap_or_default().to_string());
-        Ok(())
-    }
-
-    async fn on_error(&self, error: &str) -> Result<()> {
-        self.errors.lock().unwrap().push(error.to_string());
+    async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
+        if let DisconnectReason::TransportError { detail } = reason {
+            self.errors.lock().unwrap().push(detail.clone());
+        }
+        self.disconnects.lock().unwrap().push(reason.to_string());
+        self.typed.lock().unwrap().push(reason.clone());
         Ok(())
     }
 }
-
-/// 配置的重连间隔远小于停机后的最短等待：停机后若仍按它重连，就是「按错误快速重试」。
-const RECONNECT_INTERVAL: Duration = Duration::from_millis(100);
 
 async fn connect(port: u16, recorder: Arc<Recorder>) -> FlareClient {
     let url = format!("ws://127.0.0.1:{port}");
@@ -132,7 +128,6 @@ async fn connect(port: u16, recorder: Arc<Recorder>) -> FlareClient {
         .with_listener(recorder.clone())
         .with_device_info(DeviceInfo::new("bob-pc".to_string(), DevicePlatform::PC))
         .with_connect_timeout(Duration::from_secs(5))
-        .with_reconnect_interval(RECONNECT_INTERVAL)
         .build_with_race()
         .await
         .expect("client connects");
@@ -158,11 +153,11 @@ where
     }
 }
 
-/// 停机：客户端先收到 CLOSE(SERVER_SHUTDOWN)，以这个原因自行断开（服务端不必等满宽限期）；
-/// 监听端口随即释放，同一端口上的新实例能起来；客户端下一次发送先在抖动窗口里随机等一段再重连，
-/// 而不是按 100 ms 的重连间隔立即重试。
+/// 停机：客户端先收到 CLOSE(SERVER_SHUTDOWN)，以这个原因自行断开（服务端不必等满宽限期），上层拿到
+/// 带重连窗口的类型化原因；监听端口随即释放，同一端口上的新实例能起来，上层新建的客户端连得上。
+/// 旧客户端自己不重连：发送直接报未连接。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stop_tells_clients_why_and_they_reconnect_after_a_jittered_pause() {
+async fn stop_tells_clients_why_and_when_to_come_back() {
     let port = free_tcp_port();
     let server = start_server(port).await;
     let recorder = Arc::new(Recorder::default());
@@ -201,32 +196,37 @@ async fn stop_tells_clients_why_and_they_reconnect_after_a_jittered_pause() {
     );
     assert!(!client.is_connected_async().await);
 
-    // 停止接受新连接即释放监听端口：同一端口上的新实例能起来
+    let typed = recorder.typed.lock().unwrap().clone();
+    let Some(DisconnectReason::ServerClose(close)) = typed.first() else {
+        panic!("a typed planned close: {typed:?}");
+    };
+    assert_eq!(close.kind, CloseKind::ServerShutdown);
+    assert_eq!(
+        close.retry_window(),
+        Some((SERVER_SHUTDOWN_RECONNECT_MIN, SERVER_SHUTDOWN_RECONNECT_MAX))
+    );
+    assert!(!typed[0].counts_against_access_point());
+
+    let error = client
+        .send_frame(&frame_with_system_command(ping(), Reliability::AtLeastOnce))
+        .await
+        .expect_err("the client does not reconnect on its own");
+    assert_eq!(
+        error.code(),
+        Some(flare_core::common::error::ErrorCode::NotConnected),
+        "{error}"
+    );
+
+    // 停止接受新连接即释放监听端口：同一端口上的新实例能起来，上层新建的客户端连得上
     let restarted = start_server(port).await;
+    let renewed_recorder = Arc::new(Recorder::default());
+    let renewed = connect(port, renewed_recorder).await;
+    renewed
+        .send_frame(&frame_with_system_command(ping(), Reliability::AtLeastOnce))
+        .await
+        .expect("the new connection is usable");
 
-    let reconnect_started = Instant::now();
-    tokio::time::timeout(
-        SERVER_SHUTDOWN_RECONNECT_MAX + Duration::from_secs(5),
-        client.send_frame(&frame_with_system_command(ping(), Reliability::AtLeastOnce)),
-    )
-    .await
-    .expect("send after the shutdown must not hang")
-    .expect("send after the shutdown reconnects");
-    let reconnect_took = reconnect_started.elapsed();
-    wait_until("second CONNECT_ACK", Duration::from_secs(3), || async {
-        recorder.acks() == 2
-    })
-    .await;
-    assert!(
-        reconnect_took >= SERVER_SHUTDOWN_RECONNECT_MIN,
-        "after a shutdown the client must pause before reconnecting, took {reconnect_took:?}"
-    );
-    assert!(
-        reconnect_took < SERVER_SHUTDOWN_RECONNECT_MAX + Duration::from_secs(3),
-        "took {reconnect_took:?}"
-    );
-
-    client.disconnect().await.expect("client disconnects");
+    renewed.disconnect().await.expect("client disconnects");
     restarted.stop().await.expect("stop restarted server");
 }
 

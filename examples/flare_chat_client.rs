@@ -300,8 +300,6 @@ async fn main() -> Result<()> {
                 .with_timeout(std::time::Duration::from_secs(90)),
         )
         .with_connect_timeout(std::time::Duration::from_secs(10))
-        .with_reconnect_interval(std::time::Duration::from_secs(3))
-        .with_max_reconnect_attempts(Some(5))
         .build_with_race()
         .await?;
 
@@ -511,43 +509,26 @@ impl MessageListener for ChatListener {
         Ok(None)
     }
 
-    async fn on_connect(&self) -> Result<()> {
-        info!("✅ 已连接到服务器");
-        info!("   客户端已自动发送 CONNECT 消息，包含协商信息");
-        info!("   - 序列化格式偏好（由 ClientCore 处理）");
-        info!("   - 压缩算法偏好（由 ClientCore 处理）");
-        info!("   - 设备信息（由 ClientCore 处理）");
-        info!("   - 强制模式标记（如果启用）");
-        Ok(())
-    }
-
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        if let Some(reason) = reason {
-            // 设备冲突的断开原因就是类型化原因 DEVICE_CONFLICT；会话已结束，客户端不会自动重连
-            if flare_core::common::kick::is_device_conflict_reason(reason) {
+    async fn on_disconnect(
+        &self,
+        reason: &flare_core::client::link::DisconnectReason,
+    ) -> Result<()> {
+        use flare_core::client::link::DisconnectReason;
+        match reason {
+            // 设备冲突的断开原因就是类型化原因 DEVICE_CONFLICT；会话已结束，不要自动重连
+            DisconnectReason::Kicked {
+                reason,
+                ends_session: true,
+            } => {
                 error!("❌ 连接被踢下线: {}", reason);
                 info!("💡 提示：同一用户同一平台只能有一个设备在线");
                 info!("   请关闭当前客户端，或使用不同平台登录");
-            } else {
-                info!("❌ 连接断开: {}", reason);
             }
-        } else {
-            info!("❌ 连接断开");
-        }
-        Ok(())
-    }
-
-    async fn on_error(&self, error: &str) -> Result<()> {
-        // 判断错误类型，给出更友好的提示
-        if error.contains("connection lost") || error.contains("connection closed") {
-            warn!("⚠️  连接丢失: {}", error);
-            info!("💡 提示：这可能是网络问题或服务器关闭了连接");
-            info!("   如果启用了自动重连，客户端会尝试重新连接");
-        } else if error.contains("timeout") {
-            warn!("⚠️  连接超时: {}", error);
-            info!("💡 提示：请检查网络连接或服务器响应时间");
-        } else {
-            error!("❌ 连接错误: {}", error);
+            DisconnectReason::TransportError { detail } => {
+                warn!("⚠️  连接出错: {}", detail);
+                info!("💡 提示：这可能是网络问题或服务器关闭了连接；客户端不会自己重连");
+            }
+            other => info!("❌ 连接断开: {}", other),
         }
         Ok(())
     }

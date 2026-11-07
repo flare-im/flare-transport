@@ -3,10 +3,9 @@
 //! 本机回环起一个真实的 flare-core QUIC 服务端（平台互斥的设备管理器），客户端走
 //! `FlareClientBuilder` + 单协议 QUIC，与 SDK 在 `race_order=[QUIC]` 下的建连路径相同。
 //!
-//! 服务端关连接后的那条用例源自 p0e2e 全量 E2E 里 `relation.block_prevents_im_single_chat` 的
-//! 前置失败（W4-D）：主客户端被踢之后下一次发送走惰性重连，传输层报了 Connected，却把 CONNECT
-//! 写进了已被服务端关掉的旧流，拿不到 CONNECT_ACK，要等到心跳失败（约 24 s）才真正重连，
-//! 还被报成 token 被拒。设备冲突的踢线现在结束会话、不再重连（见第一条用例）。
+//! 客户端不自己重连：被踢、被服务端关连接之后，发送直接报未连接，重连由上层新建客户端完成——
+//! 新客户端是一条新连接，不会把 CONNECT 写进服务端已经关掉的旧流。设备冲突的踢线结束会话
+//! （见第一条用例）。
 
 #![cfg(all(
     feature = "client",
@@ -17,6 +16,7 @@
 
 use async_trait::async_trait;
 use flare_core::client::builder::flare::{FlareClient, FlareClientBuilder, MessageListener};
+use flare_core::client::link::DisconnectReason;
 use flare_core::common::cert::{SERVER_CERT_ENV, SERVER_KEY_ENV};
 use flare_core::common::compression::CompressionAlgorithm;
 use flare_core::common::config_types::{TlsConfig, TransportProtocol};
@@ -153,8 +153,6 @@ fn client_builder(port: u16, device_id: &str, listener: Arc<AckCounter>) -> Flar
         .with_format(SerializationFormat::Protobuf)
         .with_tls(tls)
         .with_connect_timeout(Duration::from_secs(5))
-        // 比下面的恢复时限长：恢复不能靠「CONNECT 写失败 → 等一个重连间隔 → 再连」兜底
-        .with_reconnect_interval(RECONNECT_INTERVAL)
 }
 
 /// 与 [`client_builder`] 相同，监听器换成记录断开原因的 [`CloseRecorder`]。
@@ -178,13 +176,9 @@ fn recorder_client_builder(
         .with_format(SerializationFormat::Protobuf)
         .with_tls(tls)
         .with_connect_timeout(Duration::from_secs(5))
-        .with_reconnect_interval(RECONNECT_INTERVAL)
 }
 
-/// 客户端的重连间隔。
-const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
-/// 被踢之后下一次发送重新拿到 CONNECT_ACK 的时限：必须直接新建连接完成握手，
-/// 不能先在旧连接上失败一次、再等一个重连间隔。
+/// 被踢之后上层新建客户端重新拿到 CONNECT_ACK 的时限。
 const RECOVERY_BOUND: Duration = Duration::from_secs(2);
 
 async fn wait_until<F, Fut>(what: &str, deadline: Duration, mut check: F)
@@ -270,19 +264,19 @@ async fn device_conflict_kick_ends_the_quic_session() {
     server.stop().await.expect("stop server");
 }
 
-/// 服务端踢线（与网关一致：先发 KICKED 再关连接）之后，客户端立即感知断开，
-/// 下一次发送新建连接并重新拿到 CONNECT_ACK。
+/// 服务端踢线（与网关一致：先发 KICKED 再关连接）之后，客户端立即以类型化原因感知断开，发送直接报
+/// 未连接（不自己重连）；上层新建的客户端在有界时间内重新拿到 CONNECT_ACK。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn server_disconnect_is_seen_at_once_and_the_next_send_reconnects() {
+async fn server_disconnect_is_seen_at_once_and_a_new_client_reconnects() {
     let (server, port) = start_server(None).await;
 
-    let owner_acks = Arc::new(AckCounter::default());
-    let owner = client_builder(port, "owner-device", owner_acks.clone())
+    let recorder = Arc::new(CloseRecorder::default());
+    let owner = recorder_client_builder(port, "owner-device", recorder.clone())
         .build_with_race()
         .await
         .expect("owner connects");
     wait_until("owner CONNECT_ACK", Duration::from_secs(5), || async {
-        owner_acks.acks() == 1
+        recorder.acks.load(Ordering::SeqCst) == 1
     })
     .await;
 
@@ -315,25 +309,52 @@ async fn server_disconnect_is_seen_at_once_and_the_next_send_reconnects() {
     )
     .await;
     assert!(kicked_at.elapsed() < Duration::from_secs(2));
+    wait_until("owner reports the kick", Duration::from_secs(2), || async {
+        !recorder.typed.lock().unwrap().is_empty()
+    })
+    .await;
+    // 服务端的 KICKED 走写队列，紧接着移除连接会丢掉还在队列里的帧：客户端看到的可能是被踢，也可能
+    // 只是对端关闭。两种都不结束会话。
+    let first = recorder.typed.lock().unwrap()[0].clone();
+    assert!(
+        matches!(
+            &first,
+            DisconnectReason::Kicked {
+                reason,
+                ends_session: false,
+            } if reason == "DEVICE_KICKED"
+        ) || matches!(first, DisconnectReason::PeerClosed { .. }),
+        "{first:?}"
+    );
+
+    let error = owner
+        .send_frame(&ping_frame())
+        .await
+        .expect_err("the kicked client does not reconnect on its own");
+    assert_eq!(error.code(), Some(ErrorCode::NotConnected), "{error}");
 
     let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(5), owner.send_frame(&ping_frame()))
+    let renewed_acks = Arc::new(AckCounter::default());
+    let renewed = client_builder(port, "owner-device", renewed_acks.clone())
+        .build_with_race()
         .await
-        .expect("send after the server close must not hang")
-        .expect("send after the server close re-CONNECTs");
+        .expect("a new client connects");
     let recovered_in = started.elapsed();
-    wait_until(
-        "owner second CONNECT_ACK",
-        Duration::from_secs(2),
-        || async { owner_acks.acks() == 2 },
-    )
+    // build_with_race 返回即已协商完成；CONNECT_ACK 交给监听器是异步的，稍等一下
+    wait_until("renewed CONNECT_ACK", Duration::from_secs(2), || async {
+        renewed_acks.acks() == 1
+    })
     .await;
     assert!(
         recovered_in < RECOVERY_BOUND,
         "re-CONNECT took {recovered_in:?}"
     );
+    renewed
+        .send_frame(&ping_frame())
+        .await
+        .expect("the new connection is usable");
 
-    owner.disconnect().await.expect("owner disconnects");
+    renewed.disconnect().await.expect("renewed disconnects");
     server.stop().await.expect("stop server");
 }
 
@@ -363,13 +384,16 @@ async fn rejected_connect_surfaces_the_typed_reason() {
         let retryable = auth_result.retryable;
         let (server, port) = start_server(Some(Arc::new(RejectAll(auth_result)))).await;
         let started = Instant::now();
-        let error = match client_builder(port, "owner-device", Arc::new(AckCounter::default()))
+        let failure = match client_builder(port, "owner-device", Arc::new(AckCounter::default()))
             .build_with_race()
             .await
         {
             Ok(_) => panic!("CONNECT must be rejected ({auth_reason})"),
-            Err(error) => error,
+            Err(failure) => failure,
         };
+        let rejection = failure.rejection().expect("a typed rejection").clone();
+        assert_eq!(rejection.code, expected_code, "{failure}");
+        let error = flare_core::common::error::FlareError::from(failure);
         assert_eq!(error.code(), Some(expected_code), "{error}");
         assert!(error.to_string().contains(expected_text), "{error}");
         assert_eq!(expected_code.is_retryable(), retryable, "{error}");
@@ -386,11 +410,12 @@ async fn rejected_connect_surfaces_the_typed_reason() {
     }
 }
 
-/// 记下断开原因与错误的监听器。
+/// 记下断开原因（文本与类型化）与传输错误的监听器。
 #[derive(Default)]
 struct CloseRecorder {
     acks: AtomicUsize,
     disconnects: std::sync::Mutex<Vec<String>>,
+    typed: std::sync::Mutex<Vec<DisconnectReason>>,
     errors: std::sync::Mutex<Vec<String>>,
 }
 
@@ -406,16 +431,12 @@ impl MessageListener for CloseRecorder {
         Ok(None)
     }
 
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        self.disconnects
-            .lock()
-            .unwrap()
-            .push(reason.unwrap_or_default().to_string());
-        Ok(())
-    }
-
-    async fn on_error(&self, error: &str) -> Result<()> {
-        self.errors.lock().unwrap().push(error.to_string());
+    async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
+        if let DisconnectReason::TransportError { detail } = reason {
+            self.errors.lock().unwrap().push(detail.clone());
+        }
+        self.disconnects.lock().unwrap().push(reason.to_string());
+        self.typed.lock().unwrap().push(reason.clone());
         Ok(())
     }
 }
@@ -477,6 +498,18 @@ async fn server_stop_tells_quic_clients_why() {
     assert!(
         stop_took < SERVER_SHUTDOWN_CLOSE_GRACE,
         "the client closed by itself: {stop_took:?}"
+    );
+    // 类型化原因里带着服务端给的重连窗口
+    let typed = recorder.typed.lock().unwrap().clone();
+    let Some(DisconnectReason::ServerClose(close)) = typed.first() else {
+        panic!("a typed planned close: {typed:?}");
+    };
+    assert_eq!(
+        close.retry_window(),
+        Some((
+            flare_core::common::shutdown::SERVER_SHUTDOWN_RECONNECT_MIN,
+            flare_core::common::shutdown::SERVER_SHUTDOWN_RECONNECT_MAX
+        ))
     );
     assert!(!client.is_connected_async().await);
 }

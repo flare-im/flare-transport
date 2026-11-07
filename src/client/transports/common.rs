@@ -2,10 +2,8 @@
 //!
 //! 提供 WebSocket 和 QUIC 客户端共享的逻辑和辅助函数
 
-use crate::client::connection::ConnectionStateManager;
 use crate::client::transports::ClientCore;
 use crate::common::error::{FlareError, Result};
-use crate::common::platform::sleep;
 use crate::common::protocol::Frame;
 use crate::transport::connection::Connection;
 use crate::transport::events::{ConnectionEvent, ConnectionObserver};
@@ -161,48 +159,6 @@ impl ClientConnectionHelper {
         Ok(())
     }
 
-    /// 尝试重连
-    ///
-    /// 统一处理重连逻辑：检查重连次数、等待间隔、关闭旧连接
-    #[allow(dead_code)] // 保留用于未来扩展或外部使用
-    pub async fn try_reconnect<F, Fut>(
-        reconnect_attempts: &mut u32,
-        max_attempts: Option<u32>,
-        reconnect_interval: std::time::Duration,
-        old_connection: Option<Arc<Mutex<Box<dyn Connection>>>>,
-        state_manager: &Arc<ConnectionStateManager>,
-        connect_fn: F,
-    ) -> Result<()>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
-    {
-        // 检查重连次数限制
-        if let Some(max) = max_attempts
-            && *reconnect_attempts >= max
-        {
-            return Err(FlareError::connection_failed(format!(
-                "Max reconnect attempts ({}) exceeded",
-                max
-            )));
-        }
-
-        state_manager.start_connecting();
-        *reconnect_attempts += 1;
-
-        // 等待重连间隔
-        sleep(reconnect_interval).await;
-
-        // 关闭旧连接
-        if let Some(conn) = old_connection {
-            let mut c = conn.lock().await;
-            let _ = c.close().await;
-        }
-
-        // 执行连接
-        connect_fn().await
-    }
-
     /// 断开连接（统一处理）
     pub async fn disconnect_internal(
         connection: Option<Arc<Mutex<Box<dyn Connection>>>>,
@@ -234,31 +190,10 @@ impl ClientConnectionHelper {
 
         // 通知连接断开事件
         core.handle_connection_event(&ConnectionEvent::Disconnected(
-            "Client disconnected".to_string(),
+            crate::client::link::CLIENT_DISCONNECTED_REASON.to_string(),
         ));
 
         close_result
-    }
-
-    /// 检查是否可以重连
-    pub fn can_reconnect(max_attempts: Option<u32>) -> bool {
-        max_attempts.map(|n| n > 0).unwrap_or(true)
-    }
-
-    /// 发送前是否由传输客户端自己重连：未连接、不是我方主动断开、没有被服务端以结束会话的原因踢掉
-    /// （[`ClientCore::session_ended_by_server`]）、配置允许发送前重连
-    /// （[`ClientConfig::reconnect_on_send`](crate::client::config::ClientConfig::reconnect_on_send)）
-    /// 且重连次数不为 0。
-    pub fn should_reconnect_before_send(
-        connected: bool,
-        core: &ClientCore,
-        config: &crate::client::config::ClientConfig,
-    ) -> bool {
-        !connected
-            && config.reconnect_on_send
-            && !core.is_disconnect_requested()
-            && core.session_ended_by_server().is_none()
-            && Self::can_reconnect(config.max_reconnect_attempts)
     }
 
     /// 设置连接观察者并发送 CONNECT 消息
@@ -289,46 +224,6 @@ impl ClientConnectionHelper {
 mod tests {
     use super::*;
     use crate::client::config::ClientConfig;
-
-    /// 传输客户端发送前自己重连的条件：未连接、允许发送前重连、不是我方主动断开、没有被服务端
-    /// 以结束会话的原因踢掉、重连次数不为 0。
-    #[test]
-    fn reconnect_before_send_honours_the_switch() {
-        let config = ClientConfig::default();
-        let core = ClientCore::new(&config);
-        assert!(ClientConnectionHelper::should_reconnect_before_send(
-            false, &core, &config
-        ));
-        assert!(!ClientConnectionHelper::should_reconnect_before_send(
-            true, &core, &config
-        ));
-
-        let off = ClientConfig::default().with_reconnect_on_send(false);
-        let core_off = ClientCore::new(&off);
-        assert!(
-            !ClientConnectionHelper::should_reconnect_before_send(false, &core_off, &off),
-            "reconnect_on_send = false leaves reconnecting to the caller"
-        );
-
-        let no_attempts = ClientConfig::default().with_max_reconnect_attempts(Some(0));
-        assert!(!ClientConnectionHelper::should_reconnect_before_send(
-            false,
-            &ClientCore::new(&no_attempts),
-            &no_attempts
-        ));
-
-        core.set_disconnect_requested(true);
-        assert!(!ClientConnectionHelper::should_reconnect_before_send(
-            false, &core, &config
-        ));
-
-        // 被服务端以结束会话的原因踢掉（设备冲突、租户不可用）：不再自己重连
-        let kicked = ClientCore::new(&config);
-        kicked.end_session_by_server(crate::common::kick::DEVICE_CONFLICT_REASON);
-        assert!(!ClientConnectionHelper::should_reconnect_before_send(
-            false, &kicked, &config
-        ));
-    }
 
     struct RecordingObserver(std::sync::Mutex<Vec<String>>);
 
@@ -496,17 +391,5 @@ mod tests {
             core.wait_inbound_drained(std::time::Duration::from_millis(50))
                 .await
         );
-    }
-
-    /// 旧版本序列化出的配置没有这个字段：反序列化时取默认值 `true`，行为不变。
-    #[test]
-    fn configs_without_the_switch_keep_reconnecting_on_send() {
-        let mut value = serde_json::to_value(ClientConfig::default()).expect("serialize");
-        value
-            .as_object_mut()
-            .expect("config object")
-            .remove("reconnect_on_send");
-        let config: ClientConfig = serde_json::from_value(value).expect("deserialize");
-        assert!(config.reconnect_on_send);
     }
 }

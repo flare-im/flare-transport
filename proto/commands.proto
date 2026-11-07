@@ -32,8 +32,10 @@ message SystemCommand {
     PONG           = 5; // 心跳响应（仅需 type）
     ERROR          = 6; // 错误通知（需要 message，可选 metadata）
     EVENT          = 7; // 系统事件（需要 message，可选 metadata、data）
-    AUTH           = 8; // 鉴权请求（需要 metadata，可选 data）
-    AUTH_ACK       = 9; // 鉴权响应（可选 message、metadata）
+    // 8、9 曾是 AUTH / AUTH_ACK：鉴权一直随 CONNECT 完成，这两条命令没有生产者也没有消费者，已删除。
+    // 编号保留，旧帧里的这两个值按未知命令处理。
+    reserved 8, 9;
+    reserved "AUTH", "AUTH_ACK";
     KICKED         = 10; // 被踢下线（需要 message 说明原因，可选 metadata）
     NEGOTIATION_READY = 11; // 协商完成确认（客户端收到 CONNECT_ACK 后发送，表示已准备好使用协商好的加密方式）
   }
@@ -46,9 +48,9 @@ message SystemCommand {
 
   Type type = 1;                       // 命令类型（必需）
   SerializationFormat format = 2;      // 序列化格式（仅 CONNECT/CONNECT_ACK）
-  string message = 3;                  // 说明信息（ERROR、EVENT、CLOSE、AUTH_ACK）
-  map<string, bytes> metadata = 4;     // 附加参数（CONNECT、AUTH等）
-  bytes data = 5;                      // 数据载荷（EVENT、AUTH等）
+  string message = 3;                  // 说明信息（ERROR、EVENT、CLOSE、KICKED）
+  map<string, bytes> metadata = 4;     // 附加参数（CONNECT、CONNECT_ACK、CLOSE、ERROR 等，键见 flare-core constants::metadata_keys）
+  bytes data = 5;                      // 数据载荷（EVENT 等）
   string compression = 6;              // 压缩算法（仅 CONNECT_ACK，必须是已注册的算法）
   string encryption = 7;               // 加密方式（仅 CONNECT_ACK，为未来扩展预留）
 }

@@ -5,8 +5,10 @@
 use crate::client::config::ClientConfig;
 use crate::client::connection::ConnectionStateManager;
 use crate::client::heartbeat::HeartbeatManager;
+use crate::client::link::{DisconnectReason, DisconnectReasonCell};
 use crate::client::router::MessageRouter;
 use crate::common::error::{FlareError, Result};
+use crate::common::link::{ConnectAckInfo, ServerClose, ServerRejection};
 use crate::common::protocol::Frame;
 use crate::common::protocol::flare::core::commands::command::Type;
 use crate::common::protocol::flare::core::commands::notification_command::Type as NotificationCommandType;
@@ -41,34 +43,11 @@ const MAX_WASM_INBOUND_QUEUE: usize = 512;
 pub use crate::common::kick::TENANT_UNAVAILABLE_REASON;
 
 /// 把服务端拒绝 CONNECT 时下发的 ERROR 帧（`message` 为类型化原因，`metadata.code` 为错误码）
-/// 映射成客户端错误。
-///
-/// - `TENANT_UNAVAILABLE` → `PERMISSION_DENIED`；
-/// - 其余能识别的错误码（如 `AUTHENTICATION_FAILED`、`TOKEN_EXPIRED`，以及服务端暂时放不了行时的
-///   `SERVICE_UNAVAILABLE`）原样使用；
-/// - 原因认不出时退回 `metadata.code`，再认不出就是 `CONNECTION_REFUSED`。
+/// 映射成客户端错误，归类规则见 [`ServerRejection::classify`]。
 ///
 /// 错误文本以类型化原因开头，上层可以据此分辨。
 pub fn connect_rejection_error(reason: &str, code: Option<&str>) -> FlareError {
-    let reason = reason.trim();
-    let code = code.map(str::trim).filter(|code| !code.is_empty());
-    let error_code = if reason == TENANT_UNAVAILABLE_REASON {
-        crate::common::error::ErrorCode::PermissionDenied
-    } else {
-        parse_error_code(reason)
-            .or_else(|| code.and_then(parse_error_code))
-            .unwrap_or(crate::common::error::ErrorCode::ConnectionRefused)
-    };
-    let label = if reason.is_empty() {
-        code.unwrap_or(error_code.as_str())
-    } else {
-        reason
-    };
-    FlareError::localized(error_code, format!("{label}: server rejected CONNECT"))
-}
-
-fn parse_error_code(value: &str) -> Option<crate::common::error::ErrorCode> {
-    serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+    ServerRejection::classify(reason, code).to_error()
 }
 
 /// 连接在 CONNECT_ACK 之前被关掉、服务端又没给原因时的错误：这是连接失败，不能猜成令牌被拒。
@@ -153,9 +132,17 @@ pub struct ClientCore {
     negotiation_failure: Arc<StdMutex<Option<FlareError>>>,
     /// 我方已请求断开（disconnect_internal 中置位）：若随后读循环仍收到 KICK，不向观察者通知「被踢」，避免重复登录/协议竞速时误报
     disconnect_requested: Arc<AtomicBool>,
-    /// 上一条连接因服务端停机而断开（收到 CLOSE(SERVER_SHUTDOWN)，或断开原因是停机）：
-    /// 下一次重连先随机等一小段（见 [`crate::common::shutdown`]），新连接建立时清除。
-    server_shutdown: Arc<AtomicBool>,
+    /// CONNECT_ACK 带回的接入信息；新连接建立时清除。
+    connect_ack: Arc<StdMutex<Option<ConnectAckInfo>>>,
+    /// 服务端拒绝 CONNECT 的类型化原因（带过载等待、最低构建号等字段）；新连接建立时清除。
+    rejection: Arc<StdMutex<Option<ServerRejection>>>,
+    /// 协商完成后收到的计划性 CLOSE（排空、停机、再均衡）：随后的断开以它作为原因上报。
+    /// 新连接建立时清除。
+    server_close: Arc<StdMutex<Option<ServerClose>>>,
+    /// 这条连接最近一次上报给观察者的断开原因（类型化）。
+    disconnect_reason: DisconnectReasonCell,
+    /// 竞速里等着交给胜出连接的上层绑定（见 [`LinkBinding`]）。
+    link_binding: Arc<StdMutex<BindingState>>,
     /// 服务端以结束会话的原因踢线（设备冲突、租户不可用，见 [`crate::common::kick::ends_session`]）：
     /// 记下原因，此后不再自动重连（包括发送前的重连），由应用重新登录后显式建连；新连接建立时清除。
     session_ended_by_server: Arc<StdMutex<Option<String>>>,
@@ -209,6 +196,37 @@ impl Drop for InboundFrameDone {
     }
 }
 
+/// 竞速里等着交给胜出连接的上层绑定：上层观察者，以及上层读断开原因用的槽。
+///
+/// 只有正在发 CONNECT 的那条尝试持有它；收到 CONNECT_ACK 时整体挂上（[`ClientCore`] 在通知等待
+/// 协商的一方之前完成，竞速返回时观察者已经在了，紧跟 CONNECT_ACK 的帧不会丢）。尝试失败时由竞速
+/// 收回，落败连接的事件不会到上层。
+#[derive(Clone, Default)]
+pub(crate) struct LinkBinding {
+    pub(crate) observers: Vec<ArcObserver>,
+    pub(crate) reason_slot: Option<Arc<std::sync::OnceLock<DisconnectReasonCell>>>,
+}
+
+/// 上层绑定在一条连接上的状态。
+#[derive(Default)]
+enum BindingState {
+    #[default]
+    Unbound,
+    Pending(LinkBinding),
+    Adopted,
+}
+
+/// 收回上层绑定的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingRevoke {
+    /// 收回了：上层没有挂到这条连接上。
+    Revoked,
+    /// 收回之前 CONNECT_ACK 已经到了，上层已经挂上：这条连接其实成功了。
+    AlreadyAdopted,
+    /// 这条连接没有绑定。
+    Unbound,
+}
+
 /// 连接断开或出错时向观察者报什么（见 [`ClientCore::close_report`]）。
 enum CloseReport {
     /// 照常上报这次事件。
@@ -247,7 +265,11 @@ impl ClientCore {
             negotiation_notify: Arc::new(Notify::new()),
             negotiation_failure: Arc::new(StdMutex::new(None)),
             disconnect_requested: Arc::new(AtomicBool::new(false)),
-            server_shutdown: Arc::new(AtomicBool::new(false)),
+            connect_ack: Arc::new(StdMutex::new(None)),
+            rejection: Arc::new(StdMutex::new(None)),
+            server_close: Arc::new(StdMutex::new(None)),
+            disconnect_reason: Arc::new(StdMutex::new(None)),
+            link_binding: Arc::new(StdMutex::new(BindingState::Unbound)),
             session_ended_by_server: Arc::new(StdMutex::new(None)),
             pending_kick: Arc::new(StdMutex::new(None)),
             kick_reported: Arc::new(AtomicBool::new(false)),
@@ -296,37 +318,42 @@ impl ClientCore {
         self.disconnect_requested.store(value, Ordering::SeqCst);
     }
 
-    /// 重连前该等多久：上一条连接因服务端停机而断开时，在
-    /// [`SERVER_SHUTDOWN_RECONNECT_MIN`](crate::common::shutdown::SERVER_SHUTDOWN_RECONNECT_MIN)–
-    /// [`SERVER_SHUTDOWN_RECONNECT_MAX`](crate::common::shutdown::SERVER_SHUTDOWN_RECONNECT_MAX)
-    /// 之间随机取值（只用一次），否则用 `configured`。
-    ///
-    /// 停机是计划内的：按配置的间隔立即重试，只会撞上还没起来的实例；所有客户端同一刻重连，
-    /// 又会把刚起来的实例冲垮。
-    pub fn reconnect_delay(&self, configured: std::time::Duration) -> std::time::Duration {
-        if self.server_shutdown.swap(false, Ordering::SeqCst) {
-            crate::common::shutdown::server_shutdown_reconnect_delay()
-        } else {
-            configured
-        }
-    }
-
-    /// 上一条连接是否因服务端停机而断开（新连接建立后复位）。
-    pub fn closed_by_server_shutdown(&self) -> bool {
-        self.server_shutdown.load(Ordering::SeqCst)
-    }
-
-    /// 我方是否已主动断开这个客户端。主动断开后它不能再被「发送前自动重连」拉起来：
-    /// 上层（SDK）已经换了新客户端或登出，旧客户端复活会带着旧 token 建出一条上层不知道的连接。
+    /// 我方是否已主动断开这个客户端。
     pub fn is_disconnect_requested(&self) -> bool {
         self.disconnect_requested.load(Ordering::SeqCst)
+    }
+
+    /// CONNECT_ACK 带回的接入信息（协商完成之前为 `None`）。
+    pub fn connect_ack_info(&self) -> Option<ConnectAckInfo> {
+        self.connect_ack.lock().ok().and_then(|info| info.clone())
+    }
+
+    /// 服务端拒绝 CONNECT 的类型化原因（这条连接没被拒时为 `None`）。
+    pub fn server_rejection(&self) -> Option<ServerRejection> {
+        self.rejection
+            .lock()
+            .ok()
+            .and_then(|rejection| rejection.clone())
+    }
+
+    /// 这条连接最近一次上报给观察者的断开原因。
+    pub fn last_disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.disconnect_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    /// 断开原因的槽：观察者收到断开、错误事件时，从这里读同一次事件的类型化原因。
+    pub fn disconnect_reason_cell(&self) -> DisconnectReasonCell {
+        Arc::clone(&self.disconnect_reason)
     }
 
     /// 服务端已以结束会话的原因（设备冲突、租户不可用，见 [`crate::common::kick::ends_session`]）
     /// 踢掉这个客户端时，返回那个原因。
     ///
-    /// 此后它不再自动重连（包括发送前的重连）：设备冲突时连回去会把新设备再顶下线、两台设备来回互踢，
-    /// 租户不可用时重连只会被再拒一次。应用重新登录后显式建连，新连接建立时清除。
+    /// 恢复要由应用重新登录后显式建连（设备冲突时连回去会把新设备再顶下线、两台设备来回互踢，
+    /// 租户不可用时重连只会被再拒一次）；新连接建立时清除。
     pub fn session_ended_by_server(&self) -> Option<String> {
         self.session_ended_by_server
             .lock()
@@ -410,49 +437,71 @@ impl ClientCore {
         crate::common::platform::timeout(bound, wait).await.is_ok()
     }
 
-    /// 协议竞速：与主 core 共享 disconnect / 协商 / pending 状态，避免 loser KICK 误报。
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(feature = "websocket", feature = "quic", feature = "tcp")
-    ))]
-    pub(crate) fn share_race_state_from(&mut self, shared: &ClientCore) {
-        self.observers = Arc::clone(&shared.observers);
-        self.pending_map = Arc::clone(&shared.pending_map);
-        self.disconnect_requested = Arc::clone(&shared.disconnect_requested);
-        self.negotiation_completed = Arc::clone(&shared.negotiation_completed);
-        self.negotiation_notify = Arc::clone(&shared.negotiation_notify);
-        self.negotiation_failure = Arc::clone(&shared.negotiation_failure);
-        self.server_shutdown = Arc::clone(&shared.server_shutdown);
-        self.session_ended_by_server = Arc::clone(&shared.session_ended_by_server);
-        self.pending_kick = Arc::clone(&shared.pending_kick);
-        self.kick_reported = Arc::clone(&shared.kick_reported);
-        self.heartbeat_config = Arc::clone(&shared.heartbeat_config);
-        self.heartbeat_probe_wake = Arc::clone(&shared.heartbeat_probe_wake);
+    /// 竞速里一个协议尝试用的 core：除心跳策略、验活唤醒与事件处理器之外，状态都是它自己的。
+    ///
+    /// 心跳策略与验活唤醒要与 `base` 共享：上层在建连前后设置的前后台状态、NAT 探测结果，以及
+    /// 包装层缓存的验活句柄，都要落到最终胜出的那条连接上。观察者不共享：上层观察者只在收到
+    /// CONNECT_ACK 时挂到胜出的那条上（见 [`LinkBinding`]），落败连接的事件到不了上层。
+    pub(crate) fn for_attempt(config: &ClientConfig, base: &ClientCore) -> Self {
+        let mut core = Self::new(config);
+        core.heartbeat_config = Arc::clone(&base.heartbeat_config);
+        core.heartbeat_probe_wake = Arc::clone(&base.heartbeat_probe_wake);
+        core.event_handler = base.event_handler.clone();
+        core
     }
 
-    /// 协议竞速：未选中的连接关闭之前与主 core 脱钩，换回自己的一份状态
-    /// （[`Self::share_race_state_from`] 的反向）。
-    ///
-    /// 不脱钩时，它关闭时的断开、错误事件经共享的观察者列表到上层，看起来像选中的连接出了事；
-    /// 它关闭前置位的「我方已主动断开」也留在共享标记上，选中的连接此后被踢时不通知观察者、
-    /// CONNECT 被拒时不立即结束协商等待。
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(feature = "websocket", feature = "quic", feature = "tcp")
-    ))]
-    pub(crate) fn detach_race_state(&mut self) {
-        self.observers = Arc::new(StdMutex::new(Vec::new()));
-        self.pending_map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        self.disconnect_requested = Arc::new(AtomicBool::new(false));
-        self.negotiation_completed = Arc::new(AtomicBool::new(false));
-        self.negotiation_notify = Arc::new(Notify::new());
-        self.negotiation_failure = Arc::new(StdMutex::new(None));
-        self.server_shutdown = Arc::new(AtomicBool::new(false));
-        self.session_ended_by_server = Arc::new(StdMutex::new(None));
-        self.pending_kick = Arc::new(StdMutex::new(None));
-        self.kick_reported = Arc::new(AtomicBool::new(false));
-        self.heartbeat_config = Arc::new(StdRwLock::new(self.config.heartbeat.clone()));
-        self.heartbeat_probe_wake = Arc::new(Notify::new());
+    /// 把上层绑定交给这条连接：它发 CONNECT 之前调用。收到 CONNECT_ACK 时整体挂上。
+    pub(crate) fn set_link_binding(&self, binding: LinkBinding) {
+        if let Ok(mut state) = self.link_binding.lock() {
+            *state = BindingState::Pending(binding);
+        }
+    }
+
+    /// 收回上层绑定：这条连接没能在时限内完成 CONNECT 时调用。CONNECT_ACK 恰好在这之前到达、
+    /// 上层已经挂上时返回 [`BindingRevoke::AlreadyAdopted`]，调用方应把这条连接当作成功。
+    pub(crate) fn revoke_link_binding(&self) -> BindingRevoke {
+        let Ok(mut state) = self.link_binding.lock() else {
+            return BindingRevoke::Unbound;
+        };
+        match std::mem::take(&mut *state) {
+            BindingState::Pending(_) => BindingRevoke::Revoked,
+            BindingState::Adopted => {
+                *state = BindingState::Adopted;
+                BindingRevoke::AlreadyAdopted
+            }
+            BindingState::Unbound => BindingRevoke::Unbound,
+        }
+    }
+
+    /// 收到 CONNECT_ACK：把等着的上层绑定挂上，并只给新挂上的观察者补一个 `Connected`（对它们来说
+    /// 连接这时才可用）。
+    fn adopt_link_binding(&self) {
+        let binding = {
+            let Ok(mut state) = self.link_binding.lock() else {
+                return;
+            };
+            match std::mem::take(&mut *state) {
+                BindingState::Pending(binding) => {
+                    *state = BindingState::Adopted;
+                    binding
+                }
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        if let Some(slot) = &binding.reason_slot {
+            let _ = slot.set(Arc::clone(&self.disconnect_reason));
+        }
+        for observer in &binding.observers {
+            self.add_observer(Arc::clone(observer));
+        }
+        deliver_to_observers(
+            &binding.observers,
+            &ConnectionEvent::Connected,
+            "client core",
+        );
     }
 
     /// 确定初始序列化格式和压缩算法
@@ -789,16 +838,16 @@ impl ClientCore {
         &self,
         sys_cmd: &crate::common::protocol::SystemCommand,
     ) {
-        let code = sys_cmd
-            .metadata
-            .get("code")
-            .and_then(|code| std::str::from_utf8(code).ok());
-        let error = connect_rejection_error(&sys_cmd.message, code);
+        let rejection = ServerRejection::from_command(sys_cmd);
+        let error = rejection.to_error();
         if let Ok(mut failure) = self.negotiation_failure.lock() {
             if failure.is_some() {
                 return;
             }
             tracing::warn!("[ClientCore] CONNECT rejected by server: {}", error);
+            if let Ok(mut stored) = self.rejection.lock() {
+                *stored = Some(rejection);
+            }
             *failure = Some(error);
         }
         self.negotiation_notify.notify_waiters();
@@ -816,6 +865,15 @@ impl ClientCore {
         // 处理 CONNECT_ACK
         match self.handle_connect_ack(frame) {
             Ok((format, compression, encryption)) => {
+                if let Some(Type::System(sys_cmd)) =
+                    frame.command.as_ref().and_then(|cmd| cmd.r#type.as_ref())
+                    && let Ok(mut info) = self.connect_ack.lock()
+                {
+                    *info = Some(ConnectAckInfo::from_metadata(&sys_cmd.metadata));
+                }
+                // 先挂上上层观察者，再标记协商完成（唤醒竞速）：竞速返回时上层已经在了，
+                // 这帧 CONNECT_ACK 与紧随其后的帧都能到上层。
+                self.adopt_link_binding();
                 tracing::info!(
                     "[ClientCore] 收到 CONNECT_ACK: 服务端确定的序列化方式={:?}, 压缩方式={:?}, 加密方式={:?}",
                     format,
@@ -940,12 +998,14 @@ impl ClientCore {
         tracing::info!("[ClientCore] 连接已断开（被踢）: {}", kick_reason);
     }
 
-    /// 处理服务端下发的 CLOSE：服务端要关闭这条连接（典型是停机，原因为 `SERVER_SHUTDOWN`）。
+    /// 处理服务端下发的 CLOSE：服务端要关闭这条连接（排空 `DRAIN`、停机 `SERVER_SHUTDOWN`、
+    /// 再均衡 `REBALANCE`）。
     ///
-    /// 协商完成后收到：以类型化原因自行断开，观察者收到的断开原因形如
-    /// `SERVER_SHUTDOWN: server closed the connection`，上层据此调整重连节奏（停机后先随机等一小段，
-    /// 而不是按错误立即重试）；不必等服务端在宽限期满后强行关闭。协商完成前收到：按服务端拒绝 CONNECT
-    /// 登记原因（metadata `code` 为 `SERVICE_UNAVAILABLE`，可重试）。
+    /// 协商完成后收到：记下类型化的关闭（原因、重连窗口、优先接入点），以类型化原因自行断开；观察者
+    /// 收到的断开原因形如 `SERVER_SHUTDOWN: server closed the connection`，上层从
+    /// [`DisconnectReason::ServerClose`] 读到窗口，在窗口内随机时刻重连；不必等服务端在宽限期满后
+    /// 强行关闭。协商完成前收到：按服务端拒绝 CONNECT 登记原因（metadata `code` 为
+    /// `SERVICE_UNAVAILABLE`，可重试）。
     async fn handle_close_command(
         &self,
         frame: &Frame,
@@ -960,12 +1020,14 @@ impl ClientCore {
             tracing::warn!("[ClientCore] 事件处理器处理 CLOSE 失败: {}", e);
         }
 
-        if crate::common::shutdown::is_server_shutdown_close(sys_cmd) {
-            self.server_shutdown.store(true, Ordering::SeqCst);
-        }
         if !negotiated_at_receipt {
             self.record_connect_rejection(sys_cmd);
             return;
+        }
+        if let Some(close) = ServerClose::from_command(sys_cmd)
+            && let Ok(mut stored) = self.server_close.lock()
+        {
+            *stored = Some(close);
         }
 
         let reason = Self::close_reason(sys_cmd);
@@ -1146,7 +1208,7 @@ impl ClientCore {
                 self.state_manager.set_connected();
                 if !already_connected {
                     self.reset_negotiation_state();
-                    self.server_shutdown.store(false, Ordering::SeqCst);
+                    self.reset_link_state();
                     // 被踢进入终态后，只有应用显式建连才会有新连接
                     if let Ok(mut ended) = self.session_ended_by_server.lock() {
                         *ended = None;
@@ -1161,10 +1223,6 @@ impl ClientCore {
                 // 服务端在 CONNECT_ACK 之前就关掉了连接：立即唤醒等协商的一方，别让它干等 10s 超时。
                 // 原因以服务端下发的 ERROR 帧为准（租户不可用、鉴权失败……）；没有原因就是连接失败。
                 let closed_during_negotiation = self.closed_during_negotiation();
-                // WebSocket 关闭帧、QUIC 应用关闭带来的停机原因（没收到或不认得 CLOSE 帧时）
-                if crate::common::shutdown::is_server_shutdown_reason(reason) {
-                    self.server_shutdown.store(true, Ordering::SeqCst);
-                }
                 report = self.close_report();
                 self.state_manager.set_disconnected();
                 self.negotiation_completed.store(false, Ordering::SeqCst);
@@ -1212,6 +1270,8 @@ impl ClientCore {
             }
         }
 
+        self.record_disconnect_reason(event, &report);
+
         match report {
             CloseReport::AsIs => self.notify_observers(event),
             CloseReport::Kick(reason) => {
@@ -1221,6 +1281,66 @@ impl ClientCore {
                 ?event,
                 "[ClientCore] connection already reported as kicked; not reporting the close again"
             ),
+        }
+    }
+
+    /// 新连接建立：清掉上一条连接留下的接入信息、拒绝、计划性关闭与断开原因。
+    fn reset_link_state(&self) {
+        if let Ok(mut info) = self.connect_ack.lock() {
+            *info = None;
+        }
+        if let Ok(mut rejection) = self.rejection.lock() {
+            *rejection = None;
+        }
+        if let Ok(mut close) = self.server_close.lock() {
+            *close = None;
+        }
+        if let Ok(mut reason) = self.disconnect_reason.lock() {
+            *reason = None;
+        }
+    }
+
+    /// 要上报给观察者的断开、错误：在通知之前记下类型化原因，观察者在回调里读到的就是这一次的。
+    ///
+    /// - 正在被踢：[`DisconnectReason::Kicked`]；
+    /// - 我方主动断开：[`DisconnectReason::ClientRequested`]；
+    /// - 协商完成后收到过计划性 CLOSE：[`DisconnectReason::ServerClose`]（带窗口与优先接入点）；
+    /// - 读写出错：[`DisconnectReason::TransportError`]；
+    /// - 其余按断开原因的文本归类（心跳判死、传输层带来的停机原因、对端关闭），见
+    ///   [`DisconnectReason::from_detail`]。
+    fn record_disconnect_reason(&self, event: &ConnectionEvent, report: &CloseReport) {
+        let requested = self.disconnect_requested.load(Ordering::SeqCst);
+        let reason = match (report, event) {
+            (CloseReport::AlreadyKicked, _) => return,
+            (CloseReport::Kick(reason), _) => DisconnectReason::Kicked {
+                ends_session: crate::common::kick::ends_session(reason),
+                reason: reason.clone(),
+            },
+            (CloseReport::AsIs, ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_))
+                if requested =>
+            {
+                DisconnectReason::ClientRequested
+            }
+            (CloseReport::AsIs, ConnectionEvent::Disconnected(detail)) => {
+                match self
+                    .server_close
+                    .lock()
+                    .ok()
+                    .and_then(|close| close.clone())
+                {
+                    Some(close) => DisconnectReason::ServerClose(close),
+                    None => DisconnectReason::from_detail(detail),
+                }
+            }
+            (CloseReport::AsIs, ConnectionEvent::Error(error)) => {
+                DisconnectReason::TransportError {
+                    detail: error.to_string(),
+                }
+            }
+            (CloseReport::AsIs, _) => return,
+        };
+        if let Ok(mut slot) = self.disconnect_reason.lock() {
+            *slot = Some(reason);
         }
     }
 
@@ -1244,6 +1364,14 @@ impl ClientCore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(observer);
+    }
+
+    /// 去掉全部观察者（竞速放弃一条连接时用：它关闭时的事件不再到任何上层）
+    pub(crate) fn clear_observers(&self) {
+        self.observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// 移除观察者
@@ -1345,6 +1473,18 @@ impl ClientCore {
     /// 当前实际心跳间隔。
     pub fn heartbeat_effective_interval(&self) -> std::time::Duration {
         self.current_heartbeat_config().effective_interval()
+    }
+
+    /// 最近一次心跳往返时长（心跳未启动、还没有应答过的 ping、或心跳锁正被占用时为 `None`）。
+    /// 不等锁：只是采样，下一次再取即可。
+    pub fn heartbeat_round_trip(&self) -> Option<std::time::Duration> {
+        let heartbeat = self
+            .heartbeat_manager
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Arc::clone))?;
+        let guard = heartbeat.try_lock().ok()?;
+        guard.last_round_trip()
     }
 
     /// 运行期更新心跳策略。启动前更新会影响后续启动，启动后更新会影响下一轮心跳。
@@ -1454,7 +1594,11 @@ impl Clone for ClientCore {
             negotiation_notify: Arc::clone(&self.negotiation_notify),
             negotiation_failure: Arc::clone(&self.negotiation_failure),
             disconnect_requested: Arc::clone(&self.disconnect_requested),
-            server_shutdown: Arc::clone(&self.server_shutdown),
+            connect_ack: Arc::clone(&self.connect_ack),
+            rejection: Arc::clone(&self.rejection),
+            server_close: Arc::clone(&self.server_close),
+            disconnect_reason: Arc::clone(&self.disconnect_reason),
+            link_binding: Arc::clone(&self.link_binding),
             session_ended_by_server: Arc::clone(&self.session_ended_by_server),
             pending_kick: Arc::clone(&self.pending_kick),
             kick_reported: Arc::clone(&self.kick_reported),
@@ -1544,44 +1688,184 @@ mod client_core_tests {
         );
     }
 
-    /// 服务端停机断开后，下一次重连先在抖动窗口里随机等一段（只用一次）；新连接建立后复位。
-    /// 其余断开照常按配置的间隔。
+    /// 协商完成后收到计划性 CLOSE：随后的断开以类型化的关闭上报，窗口与优先接入点都在；
+    /// 新连接建立后清除。没收到 CLOSE、只从传输层看到停机原因时也认得出是停机（没有窗口）。
     #[tokio::test]
-    async fn reconnect_after_a_server_shutdown_waits_a_jittered_pause_once() {
-        use crate::common::shutdown::{
-            SERVER_SHUTDOWN_RECONNECT_MAX, SERVER_SHUTDOWN_RECONNECT_MIN,
+    async fn a_planned_close_is_reported_with_its_window() {
+        use crate::common::link::{CloseKind, ServerClose};
+        let mut core = ClientCore::new(&ClientConfig::default());
+        core.set_client_connection(Arc::new(Mutex::new(
+            Box::new(MockConnection) as Box<dyn Connection>
+        )));
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.update_parser(
+            SerializationFormat::Json,
+            CompressionAlgorithm::None,
+            EncryptionAlgorithm::None,
+        )
+        .await;
+        core.stop_heartbeat();
+
+        let drain = ServerClose::new(CloseKind::Drain)
+            .with_retry_window(Duration::from_secs(2), Duration::from_secs(9))
+            .with_prefer_ap(["ap-2"]);
+        let frame = crate::common::protocol::frame_with_system_command(
+            drain.to_command(),
+            crate::common::protocol::Reliability::BestEffort,
+        );
+        let Some(Type::System(command)) = frame.command.as_ref().and_then(|c| c.r#type.as_ref())
+        else {
+            panic!("system command");
         };
-        let configured = Duration::from_millis(100);
-        let core = ClientCore::new(&ClientConfig::default());
-
+        core.handle_close_command(&frame, command, true).await;
         core.handle_connection_event(&ConnectionEvent::Disconnected(
-            "WebSocket connection closed by peer".to_string(),
+            "DRAIN: server closed the connection".to_string(),
         ));
-        assert!(!core.closed_by_server_shutdown());
-        assert_eq!(core.reconnect_delay(configured), configured);
+        assert_eq!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::ServerClose(drain))
+        );
 
-        for reason in [
-            "SERVER_SHUTDOWN",
-            "SERVER_SHUTDOWN: server closed the connection",
-        ] {
-            core.handle_connection_event(&ConnectionEvent::Disconnected(reason.to_string()));
-            assert!(core.closed_by_server_shutdown(), "{reason}");
-            let delay = core.reconnect_delay(configured);
-            assert!(
-                (SERVER_SHUTDOWN_RECONNECT_MIN..=SERVER_SHUTDOWN_RECONNECT_MAX).contains(&delay),
-                "{reason}: {delay:?}"
-            );
-            // 只用一次
-            assert_eq!(core.reconnect_delay(configured), configured);
-        }
-
-        // 新连接建立即复位
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        assert_eq!(core.last_disconnect_reason(), None);
         core.handle_connection_event(&ConnectionEvent::Disconnected(
             "SERVER_SHUTDOWN".to_string(),
         ));
+        assert_eq!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::ServerClose(ServerClose::new(
+                CloseKind::ServerShutdown
+            )))
+        );
+    }
+
+    /// 心跳判死、对端关闭、读写出错、主动断开各自归类。
+    #[test]
+    fn disconnects_are_typed() {
+        let core = ClientCore::new(&ClientConfig::default());
         core.handle_connection_event(&ConnectionEvent::Connected);
-        assert!(!core.closed_by_server_shutdown());
-        assert_eq!(core.reconnect_delay(configured), configured);
+        core.handle_connection_event(&ConnectionEvent::Disconnected(
+            crate::client::heartbeat::manager::HEARTBEAT_TIMEOUT_REASON.to_string(),
+        ));
+        assert_eq!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::HeartbeatTimeout)
+        );
+
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.handle_connection_event(&ConnectionEvent::Disconnected(
+            "Stream closed by peer".to_string(),
+        ));
+        assert_eq!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::PeerClosed {
+                detail: "Stream closed by peer".to_string()
+            })
+        );
+
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.handle_connection_event(&ConnectionEvent::Error(FlareError::connection_failed(
+            "read failed",
+        )));
+        assert!(matches!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::TransportError { .. })
+        ));
+
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.set_disconnect_requested(true);
+        core.handle_connection_event(&ConnectionEvent::Disconnected(
+            crate::client::link::CLIENT_DISCONNECTED_REASON.to_string(),
+        ));
+        assert_eq!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::ClientRequested)
+        );
+    }
+
+    /// CONNECT_ACK 的接入信息记在连接上；等着的上层绑定在协商完成前挂上，挂上的观察者收到
+    /// `Connected` 与这帧 CONNECT_ACK，读得到断开原因的槽。收回发生在挂上之后时报告「已挂上」。
+    #[tokio::test]
+    async fn the_connect_ack_adopts_the_pending_binding() {
+        use crate::common::link::ConnectAckInfo;
+        #[derive(Default)]
+        struct Seen(std::sync::Mutex<Vec<&'static str>>);
+        impl crate::transport::events::ConnectionObserver for Seen {
+            fn on_event(&self, event: &ConnectionEvent) {
+                let label = match event {
+                    ConnectionEvent::Connected => "connected",
+                    ConnectionEvent::Message(_) => "message",
+                    ConnectionEvent::Disconnected(_) => "disconnected",
+                    ConnectionEvent::Error(_) => "error",
+                };
+                self.0.lock().unwrap().push(label);
+            }
+        }
+
+        let core = ClientCore::new(&ClientConfig::default());
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        let seen = Arc::new(Seen::default());
+        let slot = Arc::new(std::sync::OnceLock::new());
+        core.set_link_binding(LinkBinding {
+            observers: vec![seen.clone()],
+            reason_slot: Some(Arc::clone(&slot)),
+        });
+
+        let info = ConnectAckInfo {
+            server_time_ms: Some(1_762_000_000_000),
+            access_serial: Some(0),
+            heartbeat_interval_hint_sec: Some(30),
+            gateway_id: Some("gw-1".to_string()),
+            ap_id: None,
+        };
+        let mut metadata = HashMap::new();
+        info.write_metadata(&mut metadata);
+        let ack = crate::common::protocol::frame_with_system_command(
+            crate::common::protocol::builder::connect_ack(
+                SerializationFormat::Json,
+                None,
+                None,
+                metadata,
+            ),
+            crate::common::protocol::Reliability::AtLeastOnce,
+        );
+        let data = crate::common::message::parser::PRE_NEGOTIATION_PARSER
+            .serialize(&ack)
+            .expect("serialize");
+        core.handle_received_message(data, false).await;
+        core.stop_heartbeat();
+
+        assert!(core.is_negotiation_completed());
+        assert_eq!(core.connect_ack_info(), Some(info));
+        assert_eq!(*seen.0.lock().unwrap(), vec!["connected", "message"]);
+        assert_eq!(core.revoke_link_binding(), BindingRevoke::AlreadyAdopted);
+
+        core.handle_connection_event(&ConnectionEvent::Disconnected(
+            "Stream closed by peer".to_string(),
+        ));
+        let cell = slot.get().expect("the slot is bound on adoption");
+        assert!(matches!(
+            cell.lock().unwrap().clone(),
+            Some(DisconnectReason::PeerClosed { .. })
+        ));
+
+        let other = ClientCore::new(&ClientConfig::default());
+        other.set_link_binding(LinkBinding::default());
+        assert_eq!(other.revoke_link_binding(), BindingRevoke::Revoked);
+        assert_eq!(other.revoke_link_binding(), BindingRevoke::Unbound);
+    }
+
+    /// CONNECT 被拒时，带字段的类型化拒绝记在连接上。
+    #[test]
+    fn a_rejection_keeps_its_typed_fields() {
+        let core = ClientCore::new(&ClientConfig::default());
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.record_connect_rejection(&crate::common::link::overloaded_command(
+            Duration::from_millis(1500),
+        ));
+        let rejection = core.server_rejection().expect("rejection");
+        assert_eq!(rejection.code, crate::common::error::ErrorCode::Overloaded);
+        assert_eq!(rejection.retry_after_ms, Some(1500));
     }
 
     #[test]

@@ -28,22 +28,28 @@ compile_error!(
 pub mod builder;
 pub mod config;
 pub mod connection;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dial;
 pub mod events;
 pub mod heartbeat;
+pub mod link;
+pub mod race;
 pub mod router;
 pub mod runtime;
 pub mod transports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_tokio;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub mod manager;
-
 pub use builder::{ClientBuilder, FlareClient, FlareClientBuilder, MessageListener, SimpleClient};
 pub use config::ClientConfig;
 pub use connection::{ConnectionState, ConnectionStateManager};
 pub use events::{ClientEventHandler, DefaultClientMessageObserver};
 pub use heartbeat::HeartbeatManager;
+pub use link::{
+    AttemptFailure, AttemptReport, CancelledAttempt, CloseKind, ConnectAckInfo, ConnectFailure,
+    ConnectReport, DisconnectReason, ServerClose, ServerRejection,
+};
+pub use race::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RACE_STAGGER};
 pub use router::{AsyncHandler, MessageHandler, MessageRouter, SimpleHandler};
 pub use transports::Client;
 #[cfg(feature = "websocket")]
@@ -57,8 +63,6 @@ pub use wasm_tokio::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::{ObserverClient, ObserverClientBuilder};
-#[cfg(not(target_arch = "wasm32"))]
-pub use manager::ClientConnectionManager;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "websocket", feature = "quic", feature = "tcp")

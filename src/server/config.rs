@@ -55,10 +55,24 @@ pub struct ServerConfig {
     /// 设为 0 时不等，下发后立即关闭。
     #[serde(default = "default_shutdown_close_grace")]
     pub shutdown_close_grace: Duration,
+    /// CONNECT_ACK 里报给客户端的网关实例 ID（`gateway_id`，诊断用）；不设则不报。
+    #[serde(default)]
+    pub gateway_id: Option<String>,
+    /// CONNECT_ACK 里报给客户端的接入点 ID（`ap_id`，诊断用）；不设则不报。
+    #[serde(default)]
+    pub ap_id: Option<String>,
+    /// 握手并发或连接数超限时，`OVERLOADED` 拒绝里建议客户端等待的基数；实际下发的值再加 0–50%
+    /// 随机抖动（见 [`crate::common::link::overload_retry_after`]）。默认 2 s。
+    #[serde(default = "default_overload_retry_after")]
+    pub overload_retry_after: Duration,
 }
 
 fn default_shutdown_close_grace() -> Duration {
     crate::common::shutdown::SERVER_SHUTDOWN_CLOSE_GRACE
+}
+
+fn default_overload_retry_after() -> Duration {
+    Duration::from_secs(2)
 }
 
 impl Default for ServerConfig {
@@ -84,6 +98,9 @@ impl Default for ServerConfig {
             auth_enabled: false,                   // 默认不启用认证
             auth_timeout: Duration::from_secs(30), // 默认认证超时 30 秒
             shutdown_close_grace: default_shutdown_close_grace(),
+            gateway_id: None,
+            ap_id: None,
+            overload_retry_after: default_overload_retry_after(),
         }
     }
 }
@@ -261,6 +278,24 @@ impl ServerConfig {
     /// 设置停机宽限（见 [`Self::shutdown_close_grace`]）
     pub fn with_shutdown_close_grace(mut self, grace: Duration) -> Self {
         self.shutdown_close_grace = grace;
+        self
+    }
+
+    /// 设置 CONNECT_ACK 里报给客户端的网关实例 ID（见 [`Self::gateway_id`]）
+    pub fn with_gateway_id(mut self, gateway_id: impl Into<String>) -> Self {
+        self.gateway_id = Some(gateway_id.into());
+        self
+    }
+
+    /// 设置 CONNECT_ACK 里报给客户端的接入点 ID（见 [`Self::ap_id`]）
+    pub fn with_ap_id(mut self, ap_id: impl Into<String>) -> Self {
+        self.ap_id = Some(ap_id.into());
+        self
+    }
+
+    /// 设置超限拒绝里建议客户端等待的基数（见 [`Self::overload_retry_after`]）
+    pub fn with_overload_retry_after(mut self, base: Duration) -> Self {
+        self.overload_retry_after = base;
         self
     }
 }

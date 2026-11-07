@@ -9,13 +9,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc};
 
-/// 前台/网络恢复时一次性验活的等待窗口上界。
-///
-/// 正常 ping 往返 < 100ms；心跳默认 `timeout` 高达 90s（稳态容忍抖动），
-/// 但回到前台后要立刻判定连接死活，不能等 90s。取 `min(timeout, PROBE_TIMEOUT)`
-/// 作为探测窗口，让半开死连在几秒内被戳穿并触发重连。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-
 /// 心跳判死后主动断开时报给上层的原因。不能是泛泛的 "Closed by client"：上层（SDK）把那句当成
 /// 「我方主动断开」，不会重连——连接就停在断开，界面一直显示「连接已断开」。
 pub const HEARTBEAT_TIMEOUT_REASON: &str = "heartbeat timeout: no PONG";
@@ -28,6 +21,8 @@ pub struct HeartbeatManager {
     last_ping: Arc<std::sync::Mutex<Option<MonotonicInstant>>>,
     // 使用 std::sync::Mutex，因为 record_pong 可能从同步上下文调用
     last_pong: Arc<std::sync::Mutex<Option<MonotonicInstant>>>,
+    /// 最近一次被 PONG 应答的 ping 的往返时长：上层用它更新入口健康（RTT）与连接质量。
+    last_round_trip: Arc<std::sync::Mutex<Option<Duration>>>,
     stop_tx: Option<mpsc::Sender<()>>,
 }
 
@@ -63,6 +58,7 @@ impl HeartbeatManager {
             config,
             last_ping: Arc::new(std::sync::Mutex::new(None)),
             last_pong: Arc::new(std::sync::Mutex::new(None)),
+            last_round_trip: Arc::new(std::sync::Mutex::new(None)),
             stop_tx: None,
         }
     }
@@ -225,8 +221,9 @@ impl HeartbeatManager {
                                 let _ = conn.close_with_reason(HEARTBEAT_SEND_FAILED_REASON).await;
                                 break;
                             }
-                            // 有界等待窗口（远短于 90s 心跳 timeout）：ping 往返正常 < 100ms。
-                            let probe_window = read_config(&config).timeout.min(PROBE_TIMEOUT);
+                            // 有界等待窗口（远短于 90s 心跳 timeout）：ping 往返正常 < 100ms。窗口取
+                            // `min(timeout, probe_timeout)`，由上层按接入策略设置，让半开死连在几秒内被戳穿。
+                            let probe_window = read_config(&config).effective_probe_timeout();
                             sleep(probe_window).await;
                             if !pong_covers_ping(&last_pong, ping_at) {
                                 tracing::warn!(
@@ -261,9 +258,23 @@ impl HeartbeatManager {
 
     /// 记录收到 PONG
     pub fn record_pong(&self) {
+        let now = monotonic_now();
         if let Ok(mut last) = self.last_pong.lock() {
-            *last = Some(monotonic_now());
+            *last = Some(now);
         }
+        // 只在这枚 PONG 晚于最近一次 ping 时才算一次往返：重复的 PONG 不该把 RTT 算小。
+        let ping = self.last_ping.lock().ok().and_then(|ping| *ping);
+        if let Some(ping) = ping
+            && now >= ping
+            && let Ok(mut rtt) = self.last_round_trip.lock()
+        {
+            *rtt = Some(now.duration_since(ping));
+        }
+    }
+
+    /// 最近一次心跳往返时长；还没有被应答过的 ping 时为 `None`。
+    pub fn last_round_trip(&self) -> Option<Duration> {
+        self.last_round_trip.lock().ok().and_then(|rtt| *rtt)
     }
 
     /// 仅测试用：制造一次"已发 ping、尚未收到 pong"的状态。
@@ -356,6 +367,7 @@ fn pong_covers_ping(
 mod tests {
     use super::*;
     use crate::common::MessageParser;
+    use crate::common::config_types::DEFAULT_PROBE_TIMEOUT;
     use crate::common::error::Result;
     use crate::common::platform::monotonic_now;
     use crate::transport::events::ArcObserver;
@@ -567,6 +579,50 @@ mod tests {
             closes.load(Ordering::SeqCst),
             0,
             "窗口内收到 PONG 的健康连接不得被断开"
+        );
+    }
+
+    /// 验活窗口由配置的 `probe_timeout` 决定（心跳超时很长时也一样）：窗口内没有 PONG 即判死。
+    #[tokio::test]
+    async fn probe_window_follows_the_configured_probe_timeout() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let connection: Arc<Mutex<Box<dyn Connection>>> =
+            Arc::new(Mutex::new(Box::new(CountingConnection {
+                sends: Arc::default(),
+                closes: Arc::clone(&closes),
+                last_active: monotonic_now(),
+                close_reasons: Arc::default(),
+            })));
+        let parser = Arc::new(tokio::sync::Mutex::new(MessageParser::json()));
+        let config = HeartbeatConfig::new()
+            .with_interval(Duration::from_secs(3600))
+            .with_timeout(Duration::from_secs(90))
+            .with_probe_timeout(Duration::from_millis(40));
+        assert_eq!(config.effective_probe_timeout(), Duration::from_millis(40));
+        let mut heartbeat = HeartbeatManager::with_config(config);
+        let probe_wake = Arc::new(Notify::new());
+        heartbeat.start(connection, parser, Arc::clone(&probe_wake));
+
+        probe_wake.notify_one();
+        let deadline = monotonic_now() + Duration::from_millis(800);
+        while closes.load(Ordering::SeqCst) == 0 && monotonic_now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        heartbeat.stop();
+        assert!(
+            closes.load(Ordering::SeqCst) > 0,
+            "no PONG within the 40 ms probe window: the link is declared dead"
+        );
+        // 缺省窗口与接入策略缺省一致，且不超过心跳超时。
+        assert_eq!(
+            HeartbeatConfig::default().effective_probe_timeout(),
+            DEFAULT_PROBE_TIMEOUT
+        );
+        assert_eq!(
+            HeartbeatConfig::default()
+                .with_timeout(Duration::from_secs(2))
+                .effective_probe_timeout(),
+            Duration::from_secs(2)
         );
     }
 }

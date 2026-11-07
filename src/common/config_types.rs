@@ -249,6 +249,17 @@ pub struct HeartbeatConfig {
     /// 当前应用状态。
     #[serde(default)]
     pub app_state: HeartbeatAppState,
+    /// 一次即时验活（回前台、网络变化、发送迟迟没有回执）等 PONG 的窗口；实际取 `min(timeout, 它)`。
+    /// 窗口内没有 PONG 即判死断开。由上层按接入策略（`clientPolicy.probeWakeTimeoutMs`）设置。
+    #[serde(default = "default_probe_timeout")]
+    pub probe_timeout: Duration,
+}
+
+/// 即时验活窗口的缺省值（与接入策略 `probeWakeTimeoutMs` 的缺省一致）。
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn default_probe_timeout() -> Duration {
+    DEFAULT_PROBE_TIMEOUT
 }
 
 impl Default for HeartbeatConfig {
@@ -264,6 +275,7 @@ impl Default for HeartbeatConfig {
             max_interval: Some(Duration::from_secs(120)),
             nat_timeout: None,
             app_state: HeartbeatAppState::Foreground,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
 }
@@ -328,6 +340,17 @@ impl HeartbeatConfig {
     pub fn without_nat_timeout(mut self) -> Self {
         self.nat_timeout = None;
         self
+    }
+
+    /// 设置即时验活等 PONG 的窗口。
+    pub fn with_probe_timeout(mut self, probe_timeout: Duration) -> Self {
+        self.probe_timeout = probe_timeout;
+        self
+    }
+
+    /// 即时验活实际等待的窗口：不超过心跳超时。
+    pub fn effective_probe_timeout(&self) -> Duration {
+        self.timeout.min(self.probe_timeout)
     }
 
     /// 设置应用前后台状态。

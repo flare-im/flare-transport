@@ -210,8 +210,6 @@ impl MessageHandler {
                     5 => SystemType::Pong,
                     6 => SystemType::Error,
                     7 => SystemType::Event,
-                    8 => SystemType::Auth,
-                    9 => SystemType::AuthAck,
                     _ => {
                         return Err(crate::common::error::FlareError::protocol_error(
                             "Invalid system command type",

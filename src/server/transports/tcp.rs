@@ -6,7 +6,9 @@ use crate::common::error::Result;
 use crate::server::config::ServerConfig;
 use crate::server::connection::ConnectionManager;
 use crate::server::transports::Server;
-use crate::server::transports::common::{AcceptGate, ServerConnectionHelper};
+use crate::server::transports::common::{
+    AcceptGate, ServerConnectionHelper, overload_reply_limiter, reject_overloaded,
+};
 use crate::server::transports::server_core::ServerCore;
 use crate::transport::connection::Connection;
 use crate::transport::tcp::TCPTransport;
@@ -78,6 +80,7 @@ impl Server for TCPServer {
         let is_running = Arc::clone(&self.is_running);
         let core = Arc::clone(&self.core);
         let accept_limiter = Arc::new(Semaphore::new(config.max_handshake_concurrency.max(1)));
+        let overload_limiter = overload_reply_limiter(&config);
 
         tokio::spawn(async move {
             debug!("[TCPServer] listening on {addr}");
@@ -100,6 +103,19 @@ impl Server for TCPServer {
                                     "[TCPServer] accept concurrency saturated: {}",
                                     config.max_handshake_concurrency
                                 );
+                                // 回一帧 OVERLOADED 再关；回绝名额也满了就直接丢弃
+                                if let Ok(reply) = Arc::clone(&overload_limiter).try_acquire_owned()
+                                {
+                                    let config = config.clone();
+                                    tokio::spawn(async move {
+                                        let _reply = reply;
+                                        reject_overloaded(
+                                            Box::new(TCPTransport::new(stream)),
+                                            &config,
+                                        )
+                                        .await;
+                                    });
+                                }
                                 continue;
                             }
                         };

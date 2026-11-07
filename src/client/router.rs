@@ -125,8 +125,6 @@ impl MessageRouter {
                         Ok(SysType::Pong) => "system.pong".to_string(),
                         Ok(SysType::Error) => "system.error".to_string(),
                         Ok(SysType::Event) => "system.event".to_string(),
-                        Ok(SysType::Auth) => "system.auth".to_string(),
-                        Ok(SysType::AuthAck) => "system.auth_ack".to_string(),
                         _ => "system.unknown".to_string(),
                     }
                 }

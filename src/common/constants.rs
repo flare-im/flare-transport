@@ -55,6 +55,40 @@ pub mod metadata_keys {
     pub const CLIENT_VERSION: &str = "client_version";
     /// 服务器版本
     pub const SERVER_VERSION: &str = "server_version";
+
+    /// CONNECT：客户端说的协议版本（[`super::PROTOCOL_VERSION`]）。服务端不支持时以
+    /// `PROTOCOL_VERSION_MISMATCH` 拒绝。
+    pub const PROTOCOL_VERSION: &str = "protocol_version";
+    /// CONNECT：客户端连接代数（十进制）。每次建连单调递增，上层据此丢弃旧连接迟到的帧与回调。
+    pub const CONNECTION_EPOCH: &str = "connection_epoch";
+    /// CONNECT：客户端当前接入清单的 serial；CONNECT_ACK：服务端已知的最新 serial（都是十进制）。
+    pub const ACCESS_SERIAL: &str = "access_serial";
+
+    /// CONNECT_ACK：服务端当前时间（Unix 毫秒，十进制），客户端据此修正时钟偏差。
+    pub const SERVER_TIME_MS: &str = "server_time_ms";
+    /// CONNECT_ACK：服务端建议的心跳间隔（秒，十进制）。
+    pub const HEARTBEAT_INTERVAL_HINT_SEC: &str = "heartbeat_interval_hint_sec";
+    /// CONNECT_ACK：处理这条连接的网关实例 ID（诊断用）。
+    pub const GATEWAY_ID: &str = "gateway_id";
+    /// CONNECT_ACK：这条连接所在的接入点 ID（诊断用）。
+    pub const AP_ID: &str = "ap_id";
+
+    /// ERROR / CLOSE / KICKED：类别（错误码字符串，如 `OVERLOADED`、`SERVICE_UNAVAILABLE`）。
+    pub const CODE: &str = "code";
+    /// CLOSE / KICKED：类型化原因（如 `DRAIN`、`DEVICE_CONFLICT`）。
+    pub const REASON: &str = "reason";
+    /// CLOSE：建议的重连窗口下界（毫秒，十进制）。
+    pub const RETRY_AFTER_MIN_MS: &str = "retry_after_min_ms";
+    /// CLOSE：建议的重连窗口上界（毫秒，十进制）。
+    pub const RETRY_AFTER_MAX_MS: &str = "retry_after_max_ms";
+    /// CLOSE：重连时优先的接入点 ID，逗号分隔（可选）。
+    pub const PREFER_AP: &str = "prefer_ap";
+    /// ERROR(`OVERLOADED`)：建议等多久再连同一入口（毫秒，十进制）。
+    pub const RETRY_AFTER_MS: &str = "retry_after_ms";
+    /// ERROR(`UPGRADE_REQUIRED`)：服务端要求的最低构建号（十进制）。
+    pub const MIN_BUILD: &str = "min_build";
+    /// ERROR(`UPGRADE_REQUIRED`)：给用户看的升级说明或下载入口（可选）。
+    pub const RELEASE_HINT: &str = "release_hint";
 }
 
 /// 可靠性等级常量

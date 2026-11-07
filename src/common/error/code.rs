@@ -50,6 +50,9 @@ pub enum ErrorCode {
     MessageFormatError = 3003,
     MessageTooLarge = 3004,
     InvalidCommand = 3005,
+    /// 客户端构建号低于服务端要求的最低值：连接被拒、不可重试，需要升级后再连。
+    /// 拒绝帧带 `min_build`、`release_hint`（见 [`crate::common::link::ServerRejection`]）。
+    UpgradeRequired = 3006,
 
     // ============================================================
     // 消息相关错误 (4000-4999)
@@ -78,6 +81,8 @@ pub enum ErrorCode {
     ResourceExhausted = 6002,
     ConfigurationError = 6003,
     DatabaseError = 6004,
+    /// 服务端过载，在鉴权之前快速拒绝：同一入口等 `retry_after_ms` 后重试，不换入口、不计熔断。
+    Overloaded = 6005,
 
     // ============================================================
     // 网络相关错误 (7000-7999)
@@ -86,6 +91,9 @@ pub enum ErrorCode {
     NetworkTimeout = 7001,
     NetworkUnreachable = 7002,
     NetworkConnectionLost = 7003,
+    /// 请求可能已被服务端处理、但结果没能回来（读超时、连接中途被重置），且请求不幂等
+    /// （不带 `Idempotency-Key` 的写操作）：客户端不能自动重发，由用户确认后再试。
+    NetworkUncertain = 7004,
 
     // ============================================================
     // 序列化相关错误 (8000-8999)
@@ -141,6 +149,7 @@ impl ErrorCode {
             3003 => Some(ErrorCode::MessageFormatError),
             3004 => Some(ErrorCode::MessageTooLarge),
             3005 => Some(ErrorCode::InvalidCommand),
+            3006 => Some(ErrorCode::UpgradeRequired),
             4000 => Some(ErrorCode::MessageSendFailed),
             4001 => Some(ErrorCode::MessageDeliveryFailed),
             4002 => Some(ErrorCode::MessageNotFound),
@@ -157,10 +166,12 @@ impl ErrorCode {
             6002 => Some(ErrorCode::ResourceExhausted),
             6003 => Some(ErrorCode::ConfigurationError),
             6004 => Some(ErrorCode::DatabaseError),
+            6005 => Some(ErrorCode::Overloaded),
             7000 => Some(ErrorCode::NetworkError),
             7001 => Some(ErrorCode::NetworkTimeout),
             7002 => Some(ErrorCode::NetworkUnreachable),
             7003 => Some(ErrorCode::NetworkConnectionLost),
+            7004 => Some(ErrorCode::NetworkUncertain),
             8000 => Some(ErrorCode::SerializationError),
             8001 => Some(ErrorCode::DeserializationError),
             8002 => Some(ErrorCode::EncodingError),
@@ -197,6 +208,7 @@ impl ErrorCode {
             ErrorCode::MessageFormatError => "MESSAGE_FORMAT_ERROR",
             ErrorCode::MessageTooLarge => "MESSAGE_TOO_LARGE",
             ErrorCode::InvalidCommand => "INVALID_COMMAND",
+            ErrorCode::UpgradeRequired => "UPGRADE_REQUIRED",
             ErrorCode::MessageSendFailed => "MESSAGE_SEND_FAILED",
             ErrorCode::MessageDeliveryFailed => "MESSAGE_DELIVERY_FAILED",
             ErrorCode::MessageNotFound => "MESSAGE_NOT_FOUND",
@@ -213,10 +225,12 @@ impl ErrorCode {
             ErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
             ErrorCode::ConfigurationError => "CONFIGURATION_ERROR",
             ErrorCode::DatabaseError => "DATABASE_ERROR",
+            ErrorCode::Overloaded => "OVERLOADED",
             ErrorCode::NetworkError => "NETWORK_ERROR",
             ErrorCode::NetworkTimeout => "NETWORK_TIMEOUT",
             ErrorCode::NetworkUnreachable => "NETWORK_UNREACHABLE",
             ErrorCode::NetworkConnectionLost => "NETWORK_CONNECTION_LOST",
+            ErrorCode::NetworkUncertain => "NETWORK_UNCERTAIN",
             ErrorCode::SerializationError => "SERIALIZATION_ERROR",
             ErrorCode::DeserializationError => "DESERIALIZATION_ERROR",
             ErrorCode::EncodingError => "ENCODING_ERROR",
@@ -255,6 +269,20 @@ impl ErrorCode {
                 | ErrorCode::NetworkConnectionLost
                 | ErrorCode::ServiceUnavailable
                 | ErrorCode::ResourceExhausted
+                | ErrorCode::Overloaded
+        )
+    }
+
+    /// 建连被服务端以这个错误码拒绝后，是否只能由用户动作恢复（重新登录、升级、联系管理员），
+    /// 自动重连只会被再拒一次。
+    ///
+    /// 鉴权类（令牌问题）不在其中：令牌可以续期后重连，由上层决定。
+    pub fn is_terminal_connect_rejection(&self) -> bool {
+        matches!(
+            self,
+            ErrorCode::UpgradeRequired
+                | ErrorCode::ProtocolVersionMismatch
+                | ErrorCode::PermissionDenied
         )
     }
 }

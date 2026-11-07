@@ -120,7 +120,7 @@ async fn main() {
                             .with_interval(std::time::Duration::from_secs(20))
                             .with_timeout(std::time::Duration::from_secs(60)),
                     );
-                match HybridClient::connect_with_config(cfg).await {
+                match HybridClient::connect_with_race(cfg).await {
                     Ok(client) => {
                         connected.fetch_add(1, Ordering::Relaxed);
                         alive.fetch_add(1, Ordering::Relaxed);

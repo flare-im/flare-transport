@@ -9,8 +9,9 @@
 //! - **处理器链**：可组合多个处理器
 //! - **序列化协商**：自动协商最佳序列化格式（JSON/Protobuf）和压缩算法（None/Gzip/Zstd）
 //! - **心跳管理**：自动心跳和超时管理
-//! - **自动重连**：支持断线重连
-//! - **多协议支持**：WebSocket + QUIC 双协议竞速
+//! - **多协议支持**：WebSocket + QUIC 交错竞速（见 [`crate::client::race`]），建连结果与失败分类
+//!   类型化交给上层
+//! - **不自己重连**：连接断开后以类型化原因（[`DisconnectReason`]）通知上层，由上层新建客户端重连
 //! - **统一事件处理**：使用 Observer 模式统一处理所有事件（连接事件、消息事件等）
 //!
 //! ## 适用场景
@@ -29,6 +30,10 @@ use crate::client::HybridClient;
 #[cfg(target_arch = "wasm32")]
 use crate::client::WebSocketClient;
 use crate::client::builder::{BaseClientBuilderConfig, ClientWrapper};
+use crate::client::link::{
+    ConnectAckInfo, ConnectFailure, ConnectReport, DisconnectReason, DisconnectReasonCell,
+};
+use crate::client::transports::client_core::LinkBinding;
 use crate::common::MessageParser;
 use crate::common::config_types::{HeartbeatAppState, HeartbeatConfig};
 use crate::common::error::Result;
@@ -61,20 +66,13 @@ pub trait MessageListener: Send + Sync {
         Ok(None)
     }
 
-    /// 连接建立时调用
-    async fn on_connect(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// 连接断开时调用
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
+    /// 连接结束时调用（恰好一次语义见 [`DisconnectReason`]）：对端关闭、读写出错、心跳判死、
+    /// 被踢、服务端计划性关闭、我方主动断开都走这里。
+    ///
+    /// 建连成功不回调：[`FlareClientBuilder::build_with_race`] 返回即已收到 CONNECT_ACK，
+    /// 结果见 [`FlareClient::connect_report`]。
+    async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
         let _ = reason;
-        Ok(())
-    }
-
-    /// 连接错误时调用
-    async fn on_error(&self, error: &str) -> Result<()> {
-        let _ = error;
         Ok(())
     }
 }
@@ -87,7 +85,8 @@ pub trait MessageListener: Send + Sync {
 /// - 压缩/解压
 /// - 加密/解密
 /// - 心跳管理
-/// - 自动重连
+///
+/// 每个客户端只建一次连接；断开后由上层新建客户端重连。
 pub struct FlareClientBuilder {
     base: BaseClientBuilderConfig,
     listener: Option<Arc<dyn MessageListener>>,
@@ -260,34 +259,40 @@ impl FlareClientBuilder {
         self
     }
 
-    /// 设置连接超时
+    /// 设置单个协议一次握手的时限：传输建立（含 TLS）加 CONNECT → CONNECT_ACK，默认 8 s
     pub fn with_connect_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.base = self.base.with_connect_timeout(timeout);
         self
     }
 
-    /// 设置协议竞速超时
-    pub fn with_race_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.base = self.base.with_race_timeout(timeout);
+    /// 设置交错竞速的间隔：上一个协议这么久还没完成握手就发起下一个，默认 300 ms
+    pub fn with_race_stagger(mut self, stagger: std::time::Duration) -> Self {
+        self.base = self.base.with_race_stagger(stagger);
         self
     }
 
-    /// 设置重连间隔
-    pub fn with_reconnect_interval(mut self, interval: std::time::Duration) -> Self {
-        self.base = self.base.with_reconnect_interval(interval);
+    /// 设置这次建连的连接代数（CONNECT metadata `connection_epoch`），由上层每次建连给出
+    pub fn with_connection_epoch(mut self, epoch: u64) -> Self {
+        self.base = self.base.with_connection_epoch(epoch);
         self
     }
 
-    /// 设置最大重连次数
-    pub fn with_max_reconnect_attempts(mut self, attempts: Option<u32>) -> Self {
-        self.base = self.base.with_max_reconnect_attempts(attempts);
+    /// 设置上层当前接入清单的 serial（CONNECT metadata `access_serial`），还没有清单时为 0
+    pub fn with_access_serial(mut self, serial: u64) -> Self {
+        self.base = self.base.with_access_serial(serial);
         self
     }
 
-    /// 设置断开后发送时是否由客户端自己重连（默认 `true`）。上层自带重连循环时置为 `false`，
-    /// 见 [`crate::client::config::ClientConfig::reconnect_on_send`]。
-    pub fn with_reconnect_on_send(mut self, enabled: bool) -> Self {
-        self.base = self.base.with_reconnect_on_send(enabled);
+    /// 设置接入点的备用 IP：主机名 DNS 失败或结果可疑时才直连，TLS SNI、证书校验和钉扎仍按主机名
+    pub fn with_ip_hints(mut self, ip_hints: Vec<std::net::IpAddr>) -> Self {
+        self.base = self.base.with_ip_hints(ip_hints);
+        self
+    }
+
+    /// 设置 DoH 备用解析：DNS 失败、结果可疑或 TLS 失败时后台查一次，答复留给下一次拨号
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_doh(mut self, doh: std::sync::Arc<crate::client::dial::DohCache>) -> Self {
+        self.base = self.base.with_doh(doh);
         self
     }
 
@@ -303,19 +308,25 @@ impl FlareClientBuilder {
         self
     }
 
-    /// 构建客户端（使用协议竞速）
-    pub async fn build_with_race(self) -> Result<FlareClient> {
-        let listener = self.listener.ok_or_else(|| {
-            crate::common::error::FlareError::protocol_error(
-                "MessageListener is required".to_string(),
-            )
-        })?;
+    /// 交错竞速建连（单协议是只有一个协议的竞速），返回时已经收到 CONNECT_ACK。
+    ///
+    /// 协议优先序、交错间隔、单次握手时限分别来自 [`Self::with_protocol_race`]（没设置时只有
+    /// [`Self::with_protocol`] 一个）、[`Self::with_race_stagger`]、[`Self::with_connect_timeout`]。
+    /// 成功时 [`FlareClient::connect_report`] 给出胜出协议、握手耗时、CONNECT_ACK 信息与失败的协议；
+    /// 失败时 [`ConnectFailure`] 给出每个协议的失败类别（服务端拒绝时立即结束）。
+    ///
+    /// 监听器与观察者在收到 CONNECT_ACK 时挂到胜出的连接上：落败连接的事件到不了它们，这帧
+    /// CONNECT_ACK 与紧随其后的帧都能收到。
+    pub async fn build_with_race(self) -> std::result::Result<FlareClient, ConnectFailure> {
+        let Some(listener) = self.listener else {
+            return Err(ConnectFailure {
+                attempts: Vec::new(),
+                skipped: Vec::new(),
+                elapsed: std::time::Duration::ZERO,
+            });
+        };
 
         use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
-
-        // WASM: 先建连再初始化 pipeline，避免在 LocalSet 驱动尚未打开 WS 前卡在 pipeline.await。
-        #[cfg(target_arch = "wasm32")]
-        let client = WebSocketClient::connect_with_config(self.base.config.clone()).await?;
 
         // `MessagePipeline` is internally synchronized and cloneable. Keeping an
         // additional mutex around the whole pipeline serialized every inbound
@@ -337,30 +348,33 @@ impl FlareClientBuilder {
             pipeline.add_processor(processor).await;
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let client = HybridClient::connect_with_race(self.base.config.clone()).await?;
-
-        let wrapper = ClientWrapper::new(client);
-
-        // 创建观察者（集成消息管道）
+        let reason_slot = Arc::new(std::sync::OnceLock::new());
         let observer = Arc::new(FlareObserver {
             pipeline: pipeline.clone(),
             listener: listener.clone(),
+            reason_slot: Arc::clone(&reason_slot),
         });
+        let mut observers: Vec<Arc<dyn ConnectionObserver>> =
+            vec![observer as Arc<dyn ConnectionObserver>];
+        observers.extend(self.observers);
+        let binding = LinkBinding {
+            observers,
+            reason_slot: Some(reason_slot),
+        };
 
-        let observer_clone = observer.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let (client, report) = {
+            let client = HybridClient::connect_bound(self.base.config.clone(), binding).await?;
+            let report = client
+                .connect_report()
+                .cloned()
+                .expect("a connected hybrid client carries its connect report");
+            (client, report)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (client, report) = connect_websocket_race(&self.base.config, binding).await?;
 
-        // 添加观察者（FlareObserver 和用户提供的 observers）
-        // 注意：统一使用 Observer 模式，不再使用 event_handler
-        // 所有事件处理都通过 Observer 完成，更符合 IM SDK 的最佳实践
-        wrapper.add_observer(observer_clone).await;
-        for observer in self.observers {
-            wrapper.add_observer(observer).await;
-        }
-
-        wrapper
-            .wait_for_negotiation(std::time::Duration::from_secs(10))
-            .await?;
+        let wrapper = ClientWrapper::new(client);
         let parser = wrapper.parser_snapshot().await;
         pipeline.update_parser(parser).await;
 
@@ -368,11 +382,49 @@ impl FlareClientBuilder {
             wrapper,
             pipeline,
             listener,
+            report: Arc::new(report),
         })
     }
 }
 
-/// Flare 客户端
+/// 浏览器里只有 WebSocket：优先序里的其它协议直接记为本端不支持，其余与 native 的交错竞速相同。
+#[cfg(target_arch = "wasm32")]
+async fn connect_websocket_race(
+    config: &crate::client::config::ClientConfig,
+    binding: LinkBinding,
+) -> std::result::Result<(WebSocketClient, ConnectReport), ConnectFailure> {
+    use crate::client::link::AttemptFailure;
+    use crate::client::transports::ClientCore;
+    use crate::client::transports::attempt::TransportAttempt;
+    use crate::common::config_types::TransportProtocol;
+
+    let base = ClientCore::new(config);
+    let (attempt, report) =
+        crate::client::race::staggered_race(&config.race_params(), |protocol| match protocol {
+            TransportProtocol::WebSocket => {
+                let protocol_config = crate::client::config::ClientConfig {
+                    server_url: config.get_protocol_url(&protocol),
+                    transport: protocol,
+                    transports: None,
+                    ..config.clone()
+                };
+                let core = ClientCore::for_attempt(&protocol_config, &base);
+                Ok(TransportAttempt::new(
+                    WebSocketClient::with_core(protocol_config, core.clone()),
+                    core,
+                    binding.clone(),
+                ))
+            }
+            other => Err(AttemptFailure::Unsupported {
+                detail: format!("{other:?} is not available in the browser"),
+            }),
+        })
+        .await?;
+    let (client, _core) = attempt.into_parts();
+    Ok((client, report))
+}
+
+/// Flare 客户端：一条已协商完成的连接。
 #[derive(Clone)]
 pub struct FlareClient {
     wrapper: ClientWrapper,
@@ -380,9 +432,28 @@ pub struct FlareClient {
     pipeline: Arc<MessagePipeline>,
     #[allow(dead_code)] // 保留用于未来扩展（如动态更新监听器）
     listener: Arc<dyn MessageListener>,
+    /// 建连结果
+    report: Arc<ConnectReport>,
 }
 
 impl FlareClient {
+    /// 建连结果：胜出协议、握手耗时、CONNECT_ACK 信息、胜出前失败与被取消的协议。
+    pub fn connect_report(&self) -> &ConnectReport {
+        &self.report
+    }
+
+    /// CONNECT_ACK 带回的接入信息（服务端时间、清单 serial、心跳建议、网关与接入点）。
+    pub fn connect_ack_info(&self) -> &ConnectAckInfo {
+        &self.report.ack
+    }
+
+    /// 这条连接结束的原因（还没结束时为 `None`）。与 [`MessageListener::on_disconnect`] 收到的相同。
+    pub async fn last_disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.wrapper
+            .with_core(|core| core.last_disconnect_reason())
+            .await
+    }
+
     /// 发送消息 Frame
     pub async fn send_frame(&self, frame: &Frame) -> Result<()> {
         self.wrapper.send_frame(frame).await
@@ -463,6 +534,11 @@ impl FlareClient {
         self.wrapper.heartbeat_effective_interval().await
     }
 
+    /// 最近一次心跳往返时长：上层据此更新入口 RTT 与连接质量。还没有被应答过的 ping 时为 `None`。
+    pub async fn heartbeat_round_trip(&self) -> Option<std::time::Duration> {
+        self.wrapper.heartbeat_round_trip().await
+    }
+
     /// 更新消息管道解析器（协商完成后调用）
     pub async fn update_parser(&self, parser: MessageParser) {
         self.pipeline.update_parser(parser).await;
@@ -478,76 +554,62 @@ impl FlareClient {
 
 /// Flare 客户端观察者
 ///
-/// 协议竞速时，它在竞速结束之后才挂上：未选中的连接在选中连接发 CONNECT 之前就已与共享状态脱钩并
-/// 关闭（见 `HybridClient::connect_with_race`），这里收到的事件都来自选中的连接。
+/// 它只在胜出的连接收到 CONNECT_ACK 时挂上（见 [`LinkBinding`]），这里收到的事件都来自那条连接。
 struct FlareObserver {
     pipeline: Arc<MessagePipeline>,
     listener: Arc<dyn MessageListener>,
+    /// 挂上时绑定到那条连接的断开原因槽：断开、错误事件到来时从这里读类型化原因
+    reason_slot: Arc<std::sync::OnceLock<DisconnectReasonCell>>,
+}
+
+impl FlareObserver {
+    /// 这次断开、错误事件的类型化原因：连接在通知观察者之前把它记进槽里；万一读不到（还没绑定），
+    /// 按事件文本归类。
+    fn disconnect_reason(&self, event: &ConnectionEvent) -> DisconnectReason {
+        let recorded = self
+            .reason_slot
+            .get()
+            .and_then(|cell| cell.lock().ok().and_then(|reason| reason.clone()));
+        recorded.unwrap_or_else(|| match event {
+            ConnectionEvent::Error(error) => DisconnectReason::TransportError {
+                detail: error.to_string(),
+            },
+            ConnectionEvent::Disconnected(detail) => DisconnectReason::from_detail(detail),
+            _ => DisconnectReason::PeerClosed {
+                detail: String::new(),
+            },
+        })
+    }
+
+    fn report_disconnect(&self, reason: DisconnectReason) {
+        let listener = self.listener.clone();
+        crate::client::runtime::spawn_client_task(async move {
+            if let Err(e) = listener.on_disconnect(&reason).await {
+                error!("[FlareClient] on_disconnect 失败: {}", e);
+            }
+        });
+    }
 }
 
 impl ConnectionObserver for FlareObserver {
     fn on_event(&self, event: &ConnectionEvent) {
         match event {
             ConnectionEvent::Connected => {
-                info!("[FlareClient] 已连接");
-                // 在后台任务中调用 listener.on_connect
-                let listener = self.listener.clone();
-                crate::client::runtime::spawn_client_task(async move {
-                    if let Err(e) = listener.on_connect().await {
-                        error!("[FlareClient] on_connect 失败: {}", e);
-                    }
-                });
+                // 建连成功由 build_with_race 的返回表达，这里不再回调
+                debug!("[FlareClient] 已连接（CONNECT_ACK 已收到）");
             }
 
-            ConnectionEvent::Disconnected(reason) => {
-                // 使用 Arc<str> 避免 String clone，减少内存分配
-                let reason_arc: Arc<str> = Arc::from(reason.as_str());
-                info!("[FlareClient] 连接断开: {}", reason_arc);
-                let listener = self.listener.clone();
-                crate::client::runtime::spawn_client_task(async move {
-                    if let Err(e) = listener.on_disconnect(Some(&reason_arc)).await {
-                        error!("[FlareClient] on_disconnect 失败: {}", e);
+            ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_) => {
+                // 错误也是终止事件：连接已不可用，之后不会再补一个断开。原因在通知之前已经记在连接上，
+                // 同步读出来，免得被之后的事件覆盖。
+                let reason = self.disconnect_reason(event);
+                match event {
+                    ConnectionEvent::Error(err) => {
+                        warn!("[FlareClient] 连接错误: {:?} ({reason})", err)
                     }
-                });
-            }
-
-            ConnectionEvent::Error(err) => {
-                // 错误是终止事件，一律交给监听器。此前协议竞速时按文本把 WebSocket 协议错误当作关闭
-                // 未选中连接的正常错误吞掉，而未选中的连接根本到不了这里（见结构体说明）：被吞掉的是
-                // 选中连接自己的终止性错误，上层既收不到断开也收不到错误，关掉了发送前重连的上层
-                // （IM SDK）就不再重连。
-                let err_str = format!("{:?}", err);
-
-                // 连接丢失错误：可能是网络问题或服务器关闭连接
-                let is_connection_lost = err_str.contains("connection lost")
-                    || err_str.contains("connection closed")
-                    || err_str.contains("Connection reset");
-
-                if is_connection_lost {
-                    // 连接丢失错误，记录为 warn 级别并通知 listener
-                    // 注意：底层客户端（WebSocketClient/QUICClient）会自动尝试重连
-                    warn!("[FlareClient] 连接丢失: {:?}", err);
-                    info!("[FlareClient] 下一次发送时底层客户端会尝试重连（除非关掉了发送前重连）");
-                    let listener = self.listener.clone();
-                    // 使用 Arc<str> 避免 String clone，减少内存分配
-                    let err_str_arc: Arc<str> = Arc::from(err_str.as_str());
-                    crate::client::runtime::spawn_client_task(async move {
-                        if let Err(e) = listener.on_error(&err_str_arc).await {
-                            error!("[FlareClient] on_error 失败: {}", e);
-                        }
-                    });
-                } else {
-                    // 其他错误，正常记录并通知 listener
-                    warn!("[FlareClient] 连接错误: {:?}", err);
-                    let listener = self.listener.clone();
-                    // 使用 Arc<str> 避免 String clone，减少内存分配
-                    let err_str_arc: Arc<str> = Arc::from(err_str.as_str());
-                    crate::client::runtime::spawn_client_task(async move {
-                        if let Err(e) = listener.on_error(&err_str_arc).await {
-                            error!("[FlareClient] on_error 失败: {}", e);
-                        }
-                    });
+                    _ => info!("[FlareClient] 连接断开: {reason}"),
                 }
+                self.report_disconnect(reason);
             }
 
             ConnectionEvent::Message(data) => {
@@ -700,7 +762,11 @@ mod tests {
                 listener: listener.clone(),
             }))
             .await;
-        let observer = FlareObserver { pipeline, listener };
+        let observer = FlareObserver {
+            pipeline,
+            listener,
+            reason_slot: Arc::new(std::sync::OnceLock::new()),
+        };
 
         let slow = FrameBuilder::new()
             .with_message_id("slow-data-response".to_string())
@@ -729,10 +795,10 @@ mod tests {
         let _ = first_release_tx.send(());
     }
 
-    /// 记下 `on_error` 收到的错误文本。
+    /// 记下 `on_disconnect` 收到的断开原因。
     #[derive(Default)]
     struct ErrorRecorder {
-        errors: std::sync::Mutex<Vec<String>>,
+        reasons: std::sync::Mutex<Vec<DisconnectReason>>,
         seen: tokio::sync::Notify,
     }
 
@@ -742,8 +808,8 @@ mod tests {
             Ok(None)
         }
 
-        async fn on_error(&self, error: &str) -> Result<()> {
-            self.errors.lock().unwrap().push(error.to_string());
+        async fn on_disconnect(&self, reason: &DisconnectReason) -> Result<()> {
+            self.reasons.lock().unwrap().push(reason.clone());
             self.seen.notify_one();
             Ok(())
         }
@@ -753,12 +819,12 @@ mod tests {
         FlareObserver {
             pipeline: Arc::new(MessagePipeline::new(MessageParser::json())),
             listener,
+            reason_slot: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
-    /// WebSocket 协议错误是当前连接的终止性错误，必须交给监听器：吞掉它，上层既收不到断开也收不到
-    /// 错误，关掉发送前重连的上层就再也不会重连。协议竞速时也一样：观察者挂上时竞速已经结束，
-    /// 错误只可能来自选中的连接。
+    /// WebSocket 协议错误是当前连接的终止性错误，必须作为断开交给监听器：吞掉它，上层收不到断开，
+    /// 就再也不会重连。
     #[tokio::test]
     async fn websocket_protocol_errors_reach_the_listener() {
         let protocol_error = crate::common::error::FlareError::connection_failed(
@@ -771,8 +837,37 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), listener.seen.notified())
             .await
             .expect("the protocol error must reach the listener");
-        let errors = listener.errors.lock().unwrap().clone();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("WebSocket protocol error"), "{errors:?}");
+        let reasons = listener.reasons.lock().unwrap().clone();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            matches!(&reasons[0], DisconnectReason::TransportError { detail } if detail.contains("WebSocket protocol error")),
+            "{reasons:?}"
+        );
+    }
+
+    /// 绑定到连接后，监听器收到的是连接记下的类型化原因（这里是带窗口的计划性关闭）。
+    #[tokio::test]
+    async fn the_listener_gets_the_reason_recorded_on_the_connection() {
+        use crate::common::link::{CloseKind, ServerClose};
+        let listener = Arc::new(ErrorRecorder::default());
+        let observer = observer_with(listener.clone());
+        let close = ServerClose::new(CloseKind::Rebalance).with_retry_window(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(3),
+        );
+        let cell: DisconnectReasonCell = Arc::new(std::sync::Mutex::new(Some(
+            DisconnectReason::ServerClose(close.clone()),
+        )));
+        observer.reason_slot.set(cell).expect("bind once");
+        observer.on_event(&ConnectionEvent::Disconnected(
+            "REBALANCE: server closed the connection".to_string(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), listener.seen.notified())
+            .await
+            .expect("the close must reach the listener");
+        assert_eq!(
+            *listener.reasons.lock().unwrap(),
+            vec![DisconnectReason::ServerClose(close)]
+        );
     }
 }

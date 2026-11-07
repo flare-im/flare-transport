@@ -26,6 +26,7 @@ pub mod encryption;
 pub mod error;
 pub mod features;
 pub mod kick;
+pub mod link;
 pub mod message;
 pub mod message_observer;
 pub mod platform;
@@ -48,6 +49,7 @@ pub use encryption::{EncryptionAlgorithm, EncryptionUtil, Encryptor};
 pub use error::{ClientError, ErrorBuilder, ErrorCode, FlareError, Result, ServerError};
 pub use features::FeatureSet;
 pub use kick::{DEVICE_CONFLICT_REASON, TENANT_UNAVAILABLE_REASON};
+pub use link::{CloseKind, ConnectAckInfo, ServerClose, ServerRejection};
 pub use message::{
     ArcMessageMiddleware, ArcMessageProcessor, DelegateProcessor, FunctionProcessor, LogLevel,
     LoggingMiddleware, MessageContext, MessageEvent, MessageHandler, MessageMiddleware,

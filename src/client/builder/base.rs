@@ -115,38 +115,46 @@ impl BaseClientBuilderConfig {
         self
     }
 
-    /// 设置连接超时
+    /// 设置单个协议一次握手的时限（传输建立 + CONNECT_ACK，见 [`ClientConfig::connect_timeout`]）
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.config = self.config.with_connect_timeout(timeout);
         self
     }
 
-    /// 设置协议竞速超时
+    /// 设置交错竞速的间隔（见 [`ClientConfig::race_stagger`]）
     #[must_use]
-    pub fn with_race_timeout(mut self, timeout: Duration) -> Self {
-        self.config = self.config.with_race_timeout(timeout);
+    pub fn with_race_stagger(mut self, stagger: Duration) -> Self {
+        self.config = self.config.with_race_stagger(stagger);
         self
     }
 
-    /// 设置重连间隔
+    /// 设置这次建连的连接代数（CONNECT metadata `connection_epoch`）
     #[must_use]
-    pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
-        self.config = self.config.with_reconnect_interval(interval);
+    pub fn with_connection_epoch(mut self, epoch: u64) -> Self {
+        self.config = self.config.with_connection_epoch(epoch);
         self
     }
 
-    /// 设置最大重连次数
+    /// 设置上层当前接入清单的 serial（CONNECT metadata `access_serial`）
     #[must_use]
-    pub fn with_max_reconnect_attempts(mut self, max: Option<u32>) -> Self {
-        self.config = self.config.with_max_reconnect_attempts(max);
+    pub fn with_access_serial(mut self, serial: u64) -> Self {
+        self.config = self.config.with_access_serial(serial);
         self
     }
 
-    /// 设置断开后发送时是否由客户端自己重连（见 [`ClientConfig::reconnect_on_send`]）
+    /// 设置接入点的备用 IP（DNS 失败或结果可疑时才用，见 [`ClientConfig::ip_hints`]）
     #[must_use]
-    pub fn with_reconnect_on_send(mut self, enabled: bool) -> Self {
-        self.config = self.config.with_reconnect_on_send(enabled);
+    pub fn with_ip_hints(mut self, ip_hints: Vec<std::net::IpAddr>) -> Self {
+        self.config = self.config.with_ip_hints(ip_hints);
+        self
+    }
+
+    /// 设置 DoH 备用解析（见 [`ClientConfig::doh`]）
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_doh(mut self, doh: std::sync::Arc<crate::client::dial::DohCache>) -> Self {
+        self.config = self.config.with_doh(doh);
         self
     }
 

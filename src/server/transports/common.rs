@@ -32,6 +32,21 @@ impl ServerConnectionHelper {
         // 生成连接 ID
         let connection_id = generate_id();
 
+        // 连接数已满：先回一帧 OVERLOADED 再关，客户端按建议的等待原地重试，而不是看到一个没有原因的
+        // 关闭、当成入口故障去换入口（那会把过载推到下一个入口）。这里的检查不加锁，真正的上限仍由
+        // 下面的 `add_connection_with_limit` 在临界区里保证。
+        if manager.connection_count() >= config.max_connections {
+            debug!(
+                max_connections = config.max_connections,
+                "connection limit reached; rejecting with OVERLOADED"
+            );
+            reject_overloaded(connection, config).await;
+            return Err(crate::common::error::FlareError::localized(
+                crate::common::error::ErrorCode::Overloaded,
+                "connection limit reached",
+            ));
+        }
+
         // 从 ServerCore 获取是否需要认证
         let requires_auth = core.auth_enabled();
 
@@ -188,6 +203,50 @@ impl ServerConnectionHelper {
     }
 }
 
+/// 回绝一条超限的连接（握手并发已满或连接数已满）：发一帧协商前编码的
+/// `ERROR(OVERLOADED, retry_after_ms)`，随即关闭。不读 CONNECT、不做认证。
+///
+/// `retry_after_ms` 是配置的基数加 0–50% 抖动：同一刻被拒的一批客户端不在同一时刻撞回来。
+/// 客户端在 CONNECT_ACK 之前读到它就把这次建连判为「服务端过载」：等这么久后重试同一入口，
+/// 不换入口、不计熔断。
+pub(crate) async fn reject_overloaded(mut connection: Box<dyn Connection>, config: &ServerConfig) {
+    use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
+    use crate::common::protocol::{Reliability, frame_with_system_command};
+
+    let retry_after = crate::common::link::overload_retry_after(config.overload_retry_after);
+    let frame = frame_with_system_command(
+        crate::common::link::overloaded_command(retry_after),
+        Reliability::BestEffort,
+    );
+    match PRE_NEGOTIATION_PARSER.serialize(&frame) {
+        Ok(data) => {
+            if !matches!(
+                tokio::time::timeout(OVERLOAD_REJECTION_SEND_TIMEOUT, connection.send(&data)).await,
+                Ok(Ok(()))
+            ) {
+                debug!("overload rejection was not delivered");
+            }
+        }
+        Err(error) => warn!(%error, "serializing the overload rejection failed"),
+    }
+    let _ = tokio::time::timeout(
+        OVERLOAD_REJECTION_SEND_TIMEOUT,
+        connection.close_with_reason(crate::common::error::ErrorCode::Overloaded.as_str()),
+    )
+    .await;
+}
+
+/// 握手闸门满了以后，用来回绝超额连接的名额：回绝本身也要完成传输握手（WebSocket 升级、QUIC
+/// 握手），不能不设上限。这份名额也用完时退回直接丢弃，那时客户端只能看到连接失败。
+pub(crate) fn overload_reply_limiter(config: &ServerConfig) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        (config.max_handshake_concurrency / 8).max(16),
+    ))
+}
+
+/// 回绝帧最多等这么久写出、关闭最多等这么久：对端不读也不能拖住回绝任务。
+const OVERLOAD_REJECTION_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// 停机时等客户端自行断开的宽限期间，多久查一次连接数。
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -237,6 +296,95 @@ impl AcceptGateWatch {
     /// 入口已关闭时返回（已经关闭则立即返回）。
     pub(crate) async fn closed(&mut self) {
         let _ = self.0.wait_for(|closed| *closed).await;
+    }
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+    use crate::common::platform::{MonotonicInstant, monotonic_now};
+    use crate::transport::events::ArcObserver;
+    use async_trait::async_trait;
+
+    /// 记下写出的帧与关闭原因。
+    struct Recording {
+        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        closed: Arc<std::sync::Mutex<Option<String>>>,
+        last_active: MonotonicInstant,
+    }
+
+    #[async_trait]
+    impl Connection for Recording {
+        fn add_observer(&mut self, _observer: ArcObserver) {}
+
+        fn remove_observer(&mut self, _observer: ArcObserver) {}
+
+        async fn send(&mut self, data: &[u8]) -> crate::common::error::Result<()> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn close(&mut self) -> crate::common::error::Result<()> {
+            self.close_with_reason("closed").await
+        }
+
+        async fn close_with_reason(&mut self, reason: &str) -> crate::common::error::Result<()> {
+            *self.closed.lock().unwrap() = Some(reason.to_string());
+            Ok(())
+        }
+
+        fn last_active_time(&self) -> MonotonicInstant {
+            self.last_active
+        }
+
+        fn update_active_time(&mut self) {
+            self.last_active = monotonic_now();
+        }
+    }
+
+    /// 连接数已满：不注册这条连接，先回一帧协商前编码的 OVERLOADED（等待在基数到 1.5 倍之间）再关。
+    #[tokio::test]
+    async fn a_full_server_answers_overloaded_and_closes() {
+        use crate::common::error::ErrorCode;
+        use crate::common::link::ServerRejection;
+        use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
+        use crate::common::protocol::flare::core::commands::command;
+
+        let manager = Arc::new(ConnectionManager::new());
+        let config = ServerConfig::default()
+            .with_max_connections(0)
+            .with_overload_retry_after(Duration::from_millis(2_000));
+        let core = Arc::new(ServerCore::new(&config, Some(Arc::clone(&manager))));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed = Arc::new(std::sync::Mutex::new(None));
+        let connection = Box::new(Recording {
+            sent: sent.clone(),
+            closed: closed.clone(),
+            last_active: monotonic_now(),
+        });
+
+        let error = ServerConnectionHelper::setup_new_connection(
+            connection,
+            manager.clone(),
+            &config,
+            core,
+        )
+        .await
+        .expect_err("the server is full");
+        assert_eq!(error.code(), Some(ErrorCode::Overloaded));
+        assert_eq!(manager.connection_count(), 0);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one rejection frame");
+        let frame = PRE_NEGOTIATION_PARSER.parse(&sent[0]).expect("JSON frame");
+        let Some(command::Type::System(system)) = frame.command.and_then(|c| c.r#type) else {
+            panic!("system command expected");
+        };
+        let rejection = ServerRejection::from_command(&system);
+        assert!(rejection.is_overloaded(), "{rejection:?}");
+        let wait = rejection.retry_after_ms.expect("retry_after_ms");
+        assert!((2_000..=3_000).contains(&wait), "{wait}");
+        assert_eq!(closed.lock().unwrap().as_deref(), Some("OVERLOADED"));
     }
 }
 

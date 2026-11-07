@@ -14,11 +14,11 @@ use crate::client::HybridClient;
 #[cfg(target_arch = "wasm32")]
 use crate::client::WebSocketClient;
 
-/// 关掉了发送前重连时，未连接的发送返回的错误。
-fn not_connected_reconnect_left_to_caller() -> crate::common::error::FlareError {
+/// 未连接（或还没协商完成）时发送返回的错误。客户端不自己重连：重连由上层新建客户端完成。
+fn not_connected() -> crate::common::error::FlareError {
     crate::common::error::FlareError::localized(
         crate::common::error::ErrorCode::NotConnected,
-        "not connected; reconnect_on_send is off, reconnecting is left to the caller",
+        "not connected; reconnecting is left to the caller",
     )
 }
 
@@ -38,7 +38,6 @@ pub struct ClientWrapper {
     client: Arc<Mutex<HybridClient>>,
     #[cfg(target_arch = "wasm32")]
     client: Arc<Mutex<WebSocketClient>>,
-    reconnect_gate: Arc<Mutex<()>>,
     /// 心跳验活唤醒，建客户端时从它的 core 取一份。core 的这份句柄在客户端整个生命周期内不变
     /// （竞速中各协议的 core 共享同一份），所以请求验活不必拿 `client` 锁，见 [`Self::probe_heartbeat`]。
     heartbeat_probe_wake: Arc<tokio::sync::Notify>,
@@ -50,7 +49,6 @@ impl ClientWrapper {
         let heartbeat_probe_wake = client.core().heartbeat_probe_handle();
         Self {
             client: Arc::new(Mutex::new(client)),
-            reconnect_gate: Arc::new(Mutex::new(())),
             heartbeat_probe_wake,
         }
     }
@@ -60,14 +58,20 @@ impl ClientWrapper {
         let heartbeat_probe_wake = client.core().heartbeat_probe_handle();
         Self {
             client: Arc::new(Mutex::new(client)),
-            reconnect_gate: Arc::new(Mutex::new(())),
             heartbeat_probe_wake,
         }
     }
 
+    /// 建连并等到 CONNECT_ACK（native 走交错竞速，竞速返回即已协商完成）。最多等配置的单次握手时限。
     pub async fn connect(&self) -> Result<()> {
-        let mut client = self.client.lock().await;
-        client.connect().await
+        let (core, limit) = {
+            let mut client = self.client.lock().await;
+            client.connect().await?;
+            let core = client.core().clone();
+            let limit = core.config.connect_timeout;
+            (core, limit)
+        };
+        core.wait_for_negotiation(limit).await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -87,75 +91,17 @@ impl ClientWrapper {
         client.send_frame(frame).await
     }
 
+    /// 发送前检查连接可用：未连接（含协商未完成）直接报错，不去连服务端。只有上层能建连，
+    /// 包装层自己连上会与上层新建的连接并存（同一设备两条连接，服务端按设备冲突互踢）。
     async fn ensure_ready_for_send(&self) -> Result<()> {
         if self.is_send_ready().await {
             return Ok(());
         }
-
-        // 被服务端以结束会话的原因踢掉（设备冲突、租户不可用）：不自动重连，报出踢线原因。
-        // 关掉了发送前重连（`ClientConfig::reconnect_on_send`）：未连接就立即报错，重连只走上层自己
-        // 那一条路径。不进单飞门、不等停机抖动，发送方马上知道连接不可用。
-        {
-            let client = self.client.lock().await;
-            if !client.is_connected() {
-                if let Some(reason) = client.core().session_ended_by_server() {
-                    return Err(session_ended_by_server_error(&reason));
-                }
-                if !client.core().config.reconnect_on_send {
-                    return Err(not_connected_reconnect_left_to_caller());
-                }
-            }
+        let client = self.client.lock().await;
+        if let Some(reason) = client.core().session_ended_by_server() {
+            return Err(session_ended_by_server_error(&reason));
         }
-
-        let _single_flight = self.reconnect_gate.lock().await;
-        if self.is_send_ready().await {
-            return Ok(());
-        }
-
-        // 上一条连接因服务端停机断开：先在抖动窗口里随机等一段再连。停机是计划内的，立即重连只会
-        // 撞上还没起来的实例；所有客户端同一刻重连，又会把刚起来的实例冲垮。等待时不占着客户端锁。
-        let pause = {
-            let client = self.client.lock().await;
-            if client.is_connected() {
-                Duration::ZERO
-            } else {
-                client.core().reconnect_delay(Duration::ZERO)
-            }
-        };
-        if !pause.is_zero() {
-            tracing::info!(
-                ?pause,
-                "server shut down the previous connection; pausing before reconnecting"
-            );
-            crate::common::platform::sleep(pause).await;
-        }
-
-        {
-            let mut client = self.client.lock().await;
-            if !client.is_connected() {
-                // 等单飞门或停机抖动期间连接断了：同样不由这里重连。
-                if !client.core().config.reconnect_on_send {
-                    return Err(not_connected_reconnect_left_to_caller());
-                }
-                if let Some(reason) = client.core().session_ended_by_server() {
-                    return Err(session_ended_by_server_error(&reason));
-                }
-                // 主动断开过的客户端不自动复活：否则登出/换号后，旧会话里还在路上的一次发送
-                // 会带着旧 token 重连出一条上层状态机不知道的连接（服务端还会判成设备冲突）。
-                if client.core().is_disconnect_requested() {
-                    return Err(crate::common::error::FlareError::connection_failed(
-                        "client was disconnected on request; not reconnecting".to_string(),
-                    ));
-                }
-                client.connect().await?;
-            }
-        }
-
-        let core = {
-            let client = self.client.lock().await;
-            client.core().clone()
-        };
-        core.wait_for_negotiation(Duration::from_secs(10)).await
+        Err(not_connected())
     }
 
     async fn is_send_ready(&self) -> bool {
@@ -245,6 +191,11 @@ impl ClientWrapper {
             .await
     }
 
+    /// 最近一次心跳往返时长（心跳未启动或还没有应答过的 ping 时为 `None`）。
+    pub async fn heartbeat_round_trip(&self) -> Option<Duration> {
+        self.with_core(|core| core.heartbeat_round_trip()).await
+    }
+
     /// 获取协商后的消息解析器快照（连接完成后用于解析 `ConnectionEvent::Message` 原始字节）
     pub async fn parser_snapshot(&self) -> crate::common::MessageParser {
         let client = self.client.lock().await;
@@ -265,26 +216,6 @@ impl ClientWrapper {
 mod tests {
     use super::*;
     use crate::client::config::ClientConfig;
-
-    /// 包装层的「发送前确保已连接」同样不能拉起一个被主动断开的客户端。
-    #[tokio::test]
-    async fn ensure_ready_refuses_to_revive_a_disconnected_client() {
-        let config = ClientConfig::new("ws://127.0.0.1:9/ws".to_string()).websocket();
-        let wrapper = ClientWrapper::new(HybridClient::new(config).expect("hybrid client"));
-        wrapper
-            .disconnect()
-            .await
-            .expect("disconnect without a connection");
-
-        let ping = crate::common::protocol::frame_with_system_command(
-            crate::common::protocol::ping(),
-            crate::common::protocol::Reliability::AtLeastOnce,
-        );
-        let started = std::time::Instant::now();
-        let err = wrapper.send_frame(&ping).await.expect_err("must not send");
-        assert!(err.to_string().contains("not reconnecting"), "{err}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    }
 
     /// 只绑 127.0.0.1 的 TCP 监听，记下被接受的连接数（不说 WebSocket，握手会超时）。
     async fn counting_listener() -> (
@@ -315,16 +246,14 @@ mod tests {
         )
     }
 
-    /// 关掉发送前重连：未连接的客户端发送立即失败（`NOT_CONNECTED`），不去连服务端。上层（SDK）
-    /// 的重连监视器是唯一的重连路径，旧客户端不会在下一次发送时自己连上、与上层新建的客户端并存。
+    /// 未连接的客户端发送立即失败（`NOT_CONNECTED`），不去连服务端：建连只有上层一条路径，
+    /// 旧客户端不会在下一次发送时自己连上、与上层新建的客户端并存。主动断开过的也一样。
     #[tokio::test]
-    async fn send_does_not_reconnect_when_reconnect_on_send_is_off() {
+    async fn sending_never_dials_the_server() {
         let (url, accepted, server) = counting_listener().await;
         let config = ClientConfig::new(url)
             .websocket()
-            .with_reconnect_on_send(false)
-            .with_connect_timeout(Duration::from_millis(300))
-            .with_reconnect_interval(Duration::from_millis(10));
+            .with_connect_timeout(Duration::from_millis(300));
         let wrapper = ClientWrapper::new(HybridClient::new(config).expect("hybrid client"));
 
         let started = std::time::Instant::now();
@@ -348,34 +277,17 @@ mod tests {
             "{err}"
         );
 
+        wrapper
+            .disconnect()
+            .await
+            .expect("disconnect without a connection");
+        assert!(wrapper.send_frame(&ping()).await.is_err());
+
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             accepted.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the client must not dial the server on its own"
-        );
-        server.abort();
-    }
-
-    /// 默认（开着发送前重连）行为不变：未连接时发送会先去连服务端。
-    #[tokio::test]
-    async fn send_reconnects_by_default() {
-        let (url, accepted, server) = counting_listener().await;
-        let config = ClientConfig::new(url)
-            .websocket()
-            .with_connect_timeout(Duration::from_millis(300))
-            .with_reconnect_interval(Duration::from_millis(10))
-            .with_max_reconnect_attempts(Some(1));
-        assert!(
-            config.reconnect_on_send,
-            "reconnect on send stays the default"
-        );
-        let wrapper = ClientWrapper::new(HybridClient::new(config).expect("hybrid client"));
-
-        let _ = tokio::time::timeout(Duration::from_secs(5), wrapper.send_frame(&ping())).await;
-        assert!(
-            accepted.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "by default a send dials the server first"
         );
         server.abort();
     }

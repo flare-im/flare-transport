@@ -3,12 +3,14 @@
 //! 只处理协议层，连接状态管理、心跳、消息路由等功能委托给 ClientCore
 
 use crate::client::config::ClientConfig;
+use crate::client::dial;
+use crate::client::link::AttemptFailure;
 use crate::client::transports::common::{ClientConnectionHelper, ClientMessageObserver};
 use crate::client::transports::{Client, ClientCore};
 use crate::common::config_types::TlsConfig;
 use crate::common::error::{FlareError, Result};
 use crate::common::generate_id;
-use crate::common::platform::{sleep, timeout};
+use crate::common::platform::timeout;
 use crate::common::protocol::Frame;
 use crate::transport::connection::Connection;
 use crate::transport::events::{ArcObserver, ConnectionEvent};
@@ -17,8 +19,9 @@ use async_trait::async_trait;
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::lookup_host;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 /// QUIC 客户端
 ///
@@ -31,7 +34,6 @@ pub struct QUICClient {
     connection_prepared: bool,
     connection_id: String,
     core: ClientCore,
-    reconnect_attempts: u32,
     endpoint: Option<Endpoint>,
     _client_config: Option<quinn::ClientConfig>, // 保持 client_config 的生命周期
 }
@@ -50,7 +52,6 @@ impl QUICClient {
             connection_prepared: false,
             connection_id,
             core,
-            reconnect_attempts: 0,
             endpoint: Some(endpoint),
             _client_config: Some(client_config),
         })
@@ -78,10 +79,12 @@ impl QUICClient {
     ) -> Result<Self> {
         let connection_id = config.connection_id.clone().unwrap_or_else(generate_id);
 
-        let (endpoint, client_config) = endpoint_opt.unwrap_or_else(|| {
-            Self::create_quic_endpoint_with_tls(&config.tls)
-                .expect("Failed to create QUIC endpoint")
-        });
+        // 端点建不出来（本机 UDP 不可用、TLS 配置有误）时报错，由竞速记为这个协议的失败；
+        // 以前这里直接 panic，整个建连随之崩掉。
+        let (endpoint, client_config) = match endpoint_opt {
+            Some(prepared) => prepared,
+            None => Self::create_quic_endpoint_with_tls(&config.tls)?,
+        };
 
         Ok(Self {
             config,
@@ -89,7 +92,6 @@ impl QUICClient {
             connection_prepared: false,
             connection_id,
             core,
-            reconnect_attempts: 0,
             endpoint: Some(endpoint),
             _client_config: Some(client_config),
         })
@@ -152,10 +154,8 @@ impl QUICClient {
     async fn internal_connect(&mut self) -> Result<()> {
         // 协议竞速刚建好的网络连接直接发 CONNECT；其余情况一律新建。
         //
-        // 被踢/被服务端移除之后，旧连接还挂在 `self.connection` 上。发送前的惰性重连
-        // （`ClientWrapper::ensure_ready_for_send` → `connect()`）若复用它，CONNECT 会写进
-        // 服务端已经不读的旧流：传输层照样报 Connected，却永远等不到 CONNECT_ACK，
-        // 直到心跳在旧连接上失败才真正重连。
+        // 被踢/被服务端移除之后，旧连接还挂在 `self.connection` 上。再次 `connect()` 若复用它，
+        // CONNECT 会写进服务端已经不读的旧流：传输层照样报 Connected，却永远等不到 CONNECT_ACK。
         let connection_arc = match self.connection.take() {
             Some(prepared) if std::mem::take(&mut self.connection_prepared) => prepared,
             stale => {
@@ -177,15 +177,16 @@ impl QUICClient {
         // 通知连接成功
         self.core
             .handle_connection_event(&ConnectionEvent::Connected);
-        self.reconnect_attempts = 0;
 
         Ok(())
     }
 
     /// 建立 QUIC 连接
     async fn establish_quic_connection(&self) -> Result<Box<dyn Connection>> {
+        let deadline = Instant::now() + self.config.connect_timeout;
+
         // 解析服务器地址
-        let (server_addr, hostname) = self.parse_server_address().await?;
+        let (addresses, hostname) = self.parse_server_address().await?;
 
         // 获取 endpoint
         let endpoint = self
@@ -193,12 +194,53 @@ impl QUICClient {
             .as_ref()
             .ok_or_else(|| FlareError::connection_failed("Endpoint not initialized".to_string()))?;
 
-        // 建立连接
+        // 建立连接：IP 提示只换拨到的地址，握手的 SNI 与证书校验始终按 hostname
+        let attempts = async {
+            let mut last_error = None;
+            for (index, address) in addresses.iter().enumerate() {
+                let limit = dial::share_of(deadline, addresses.len() - index);
+                match Self::connect_address(endpoint, *address, &hostname, limit).await {
+                    Ok(connection) => return Ok(connection),
+                    // 证书或钉扎不符：换 IP 也是同一张证书
+                    Err(error)
+                        if matches!(
+                            AttemptFailure::from_establish_error(&error),
+                            AttemptFailure::Tls { .. }
+                        ) =>
+                    {
+                        if let Some(doh) = &self.config.doh {
+                            doh.tls_failed(&hostname);
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error
+                .unwrap_or_else(|| FlareError::connection_failed("No address to dial".to_string())))
+        };
+        // 解析已经用掉一部分时限：按剩下的算，否则竞速的时限先到。
+        dial::watch_dial(
+            &hostname,
+            self.config.doh.as_ref(),
+            dial::share_of(deadline, 1),
+            attempts,
+        )
+        .await
+    }
+
+    /// 向一个地址握手并打开双向流，握手最多等 `limit`
+    async fn connect_address(
+        endpoint: &Endpoint,
+        address: SocketAddr,
+        hostname: &str,
+        limit: Duration,
+    ) -> Result<Box<dyn Connection>> {
         let connecting = endpoint
-            .connect(server_addr, &hostname)
+            .connect(address, hostname)
             .map_err(|e| FlareError::connection_failed(e.to_string()))?;
 
-        let quinn_connection = timeout(self.config.connect_timeout, connecting)
+        let quinn_connection = timeout(limit, connecting)
             .await
             .map_err(|_| FlareError::connection_timeout("Connection timeout".to_string()))?
             .map_err(|e| FlareError::connection_failed(e.to_string()))?;
@@ -213,26 +255,17 @@ impl QUICClient {
         Ok(Box::new(transport))
     }
 
-    /// 解析服务器地址
-    async fn parse_server_address(&self) -> Result<(SocketAddr, String)> {
+    /// 解析服务器地址：要依次拨的地址与握手用的主机名
+    async fn parse_server_address(&self) -> Result<(Vec<SocketAddr>, String)> {
         let address_str = self
             .config
             .get_protocol_url(&crate::common::config_types::TransportProtocol::QUIC)
             .replace("quic://", "");
 
         // 尝试直接解析为 SocketAddr
-        let server_addr = match address_str.parse::<SocketAddr>() {
-            Ok(addr) => addr,
-            Err(_) => {
-                // DNS 解析
-                lookup_host(&address_str)
-                    .await
-                    .map_err(|e| FlareError::protocol_error(format!("DNS lookup failed: {}", e)))?
-                    .next()
-                    .ok_or_else(|| {
-                        FlareError::protocol_error(format!("No address found for {}", address_str))
-                    })?
-            }
+        let addresses = match address_str.parse::<SocketAddr>() {
+            Ok(addr) => vec![addr],
+            Err(_) => self.resolve_host(&address_str).await?,
         };
 
         // 确定 hostname（返回 String 而不是 &str）
@@ -247,7 +280,32 @@ impl QUICClient {
                     .to_string()
             };
 
-        Ok((server_addr, hostname))
+        Ok((addresses, hostname))
+    }
+
+    /// DNS 解析 `host:port`：成功时只用第一个结果，失败时退到 IP 提示
+    async fn resolve_host(&self, address_str: &str) -> Result<Vec<SocketAddr>> {
+        let (host, port) = address_str
+            .rsplit_once(':')
+            .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+            .ok_or_else(|| {
+                FlareError::protocol_error(format!(
+                    "DNS lookup failed: invalid socket address {address_str}"
+                ))
+            })?;
+        let mut chosen = dial::resolve(
+            host,
+            port,
+            &self.config.ip_hints,
+            self.config.doh.as_ref(),
+            self.config.connect_timeout,
+        )
+        .await
+        .map_err(|e| FlareError::protocol_error(format!("DNS lookup failed: {}", e)))?;
+        if !chosen.direct {
+            chosen.addresses.truncate(1);
+        }
+        Ok(chosen.addresses)
     }
 
     /// 设置连接和观察者
@@ -277,43 +335,6 @@ impl QUICClient {
             .await
     }
 
-    /// 尝试重连
-    async fn try_reconnect(&mut self) -> Result<()> {
-        // 检查重连次数限制
-        if let Some(max) = self.config.max_reconnect_attempts
-            && self.reconnect_attempts >= max
-        {
-            // 回落到可重连状态,避免停在 Connecting 使 can_connect() 恒 false。
-            self.core.state_manager.set_failed();
-            return Err(FlareError::connection_failed(format!(
-                "Max reconnect attempts ({}) exceeded",
-                max
-            )));
-        }
-
-        self.core.state_manager.start_connecting();
-        self.reconnect_attempts += 1;
-
-        // 等待重连间隔；上一条连接因服务端停机断开时改为短暂的随机等待
-        sleep(self.core.reconnect_delay(self.config.reconnect_interval)).await;
-
-        // 关闭旧连接
-        self.connection_prepared = false;
-        if let Some(conn) = self.connection.take() {
-            let mut c = conn.lock().await;
-            let _ = c.close().await;
-        }
-
-        // 执行连接：失败必须回落 Failed，否则卡在 Connecting 无法自愈。
-        match self.internal_connect().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.core.state_manager.set_failed();
-                Err(e)
-            }
-        }
-    }
-
     /// 获取 ClientCore（用于外部访问）
     pub fn core(&self) -> &ClientCore {
         &self.core
@@ -331,25 +352,22 @@ impl Client for QUICClient {
 
         self.core.state_manager.start_connecting();
 
+        // 只连这一次：失败交给上层，由它决定何时、向哪里重连
         match self.internal_connect().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.core.state_manager.set_failed();
-                if ClientConnectionHelper::can_reconnect(self.config.max_reconnect_attempts) {
-                    self.try_reconnect().await
-                } else {
-                    Err(e)
-                }
+                Err(e)
             }
         }
     }
 
-    fn set_disconnect_requested(&mut self, value: bool) {
-        self.core.set_disconnect_requested(value);
+    async fn establish(&mut self) -> Result<()> {
+        self.establish_network_connection().await.map(|_| ())
     }
 
-    fn detach_from_race(&mut self) {
-        self.core.detach_race_state();
+    fn set_disconnect_requested(&mut self, value: bool) {
+        self.core.set_disconnect_requested(value);
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -358,15 +376,6 @@ impl Client for QUICClient {
     }
 
     async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        // 未连接时自己重连（关掉了发送前重连、或我方已主动断开时不重连）
-        if ClientConnectionHelper::should_reconnect_before_send(
-            self.is_connected(),
-            &self.core,
-            &self.config,
-        ) {
-            self.try_reconnect().await?;
-        }
-
         self.send_frame_internal(frame).await
     }
 

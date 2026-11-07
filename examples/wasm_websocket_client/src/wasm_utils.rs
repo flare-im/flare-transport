@@ -57,21 +57,11 @@ impl MessageListener for WasmChatListener {
         Ok(None)
     }
 
-    async fn on_connect(&self) -> Result<()> {
-        (self.log)("[event] connected (MessageListener)");
-        Ok(())
-    }
-
-    async fn on_disconnect(&self, reason: Option<&str>) -> Result<()> {
-        (self.log)(&format!(
-            "[event] disconnected: {}",
-            reason.unwrap_or("unknown")
-        ));
-        Ok(())
-    }
-
-    async fn on_error(&self, error: &str) -> Result<()> {
-        (self.log)(&format!("[event] error: {error}"));
+    async fn on_disconnect(
+        &self,
+        reason: &flare_core::client::link::DisconnectReason,
+    ) -> Result<()> {
+        (self.log)(&format!("[event] disconnected: {reason}"));
         Ok(())
     }
 }

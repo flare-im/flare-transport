@@ -13,14 +13,16 @@ pub struct ClientConfig {
     pub server_url: String,
     /// 传输协议（单个）
     pub transport: TransportProtocol,
-    /// 传输协议列表（用于竞速，如果设置了此列表，transport 将被忽略）
-    /// 各协议同时建连，先建好网络连接的胜出；列表顺序是发起顺序与日志、错误信息里的编号
+    /// 交错竞速的协议优先序（设置了就忽略 `transport`）。按顺序依次发起，前一个在
+    /// [`Self::race_stagger`] 内没完成握手或已经失败才发起下一个，第一个拿到 CONNECT_ACK 的胜出
+    /// （见 [`crate::client::race`]）。上层每次建连传入，例如上次的胜者排在前面。
     pub transports: Option<Vec<TransportProtocol>>,
     /// 每个协议的独立地址配置（协议 -> 地址映射）
     /// 如果设置了此映射，每个协议将使用对应的地址
     pub protocol_urls: Option<std::collections::HashMap<TransportProtocol, String>>,
-    /// 协议竞速超时时间（如果启用多协议竞速）
-    pub race_timeout: Option<Duration>,
+    /// 交错竞速的间隔：上一个协议这么久还没完成握手（含 CONNECT_ACK），就发起下一个。默认 300 ms。
+    #[serde(default = "default_race_stagger")]
+    pub race_stagger: Duration,
     /// 序列化格式（首选格式，用于协商）
     pub serialization_format: SerializationFormat,
     /// 压缩算法（首选算法，用于协商）
@@ -30,20 +32,26 @@ pub struct ClientConfig {
     pub force_serialization_format: Option<SerializationFormat>,
     /// 强制指定的压缩算法（如果设置，则强制使用此算法，不进行协商）
     pub force_compression: Option<CompressionAlgorithm>,
-    /// 连接超时时间
-    pub connect_timeout: Duration,
-    /// 重连间隔
-    pub reconnect_interval: Duration,
-    /// 最大重连次数（None 表示无限重连）
-    pub max_reconnect_attempts: Option<u32>,
-    /// 连接断开后，下一次发送是否由客户端自己重连（默认 `true`）。
+    /// 单个协议一次握手的时限：传输建立（TCP/QUIC、TLS、WebSocket 升级）加 CONNECT → CONNECT_ACK，
+    /// 不含竞速里排队等 CONNECT 名额的时间。默认 8 s。
     ///
-    /// 上层自带重连循环时（例如 IM SDK 的重连监视器）应置为 `false`：未连接时发送直接返回
-    /// 连接错误，重连只走上层那一条路径。两条路径并行时，旧客户端会在下一次发送时自己连上，
-    /// 上层又新建一个客户端，同一用户出现两条连接（服务端按设备冲突处理），旧客户端还带着
-    /// 建连时的旧令牌，也不经过上层的重连后同步。
-    #[serde(default = "default_reconnect_on_send")]
-    pub reconnect_on_send: bool,
+    /// 客户端不会自己重连：连接断开后由上层（链路监督者）决定何时、向哪里重新建连。
+    pub connect_timeout: Duration,
+    /// 这次建连的连接代数（CONNECT metadata `connection_epoch`），由上层每次建连给出、单调递增。
+    #[serde(default)]
+    pub connection_epoch: u64,
+    /// 上层当前接入清单的 serial（CONNECT metadata `access_serial`）；还没有清单时为 0。
+    #[serde(default)]
+    pub access_serial: u64,
+    /// 接入点的备用 IP（`ipHints`）：主机名 DNS 失败或结果可疑时才直连它们（规则见
+    /// [`crate::client::dial`]），TLS SNI、证书校验和 SPKI 钉扎仍按 URL 的主机名。
+    /// WebSocket 与 QUIC 生效；浏览器不能指定 IP，这里不起作用。
+    #[serde(default)]
+    pub ip_hints: Vec<std::net::IpAddr>,
+    /// DoH 备用解析（见 [`crate::client::dial::DohCache`]）：运行时对象，由上层装配，不进配置文件。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[serde(skip)]
+    pub doh: Option<std::sync::Arc<crate::client::dial::DohCache>>,
     /// 心跳配置
     pub heartbeat: HeartbeatConfig,
     /// TLS 配置
@@ -62,8 +70,8 @@ pub struct ClientConfig {
     pub token: Option<String>,
 }
 
-fn default_reconnect_on_send() -> bool {
-    true
+fn default_race_stagger() -> Duration {
+    crate::client::race::DEFAULT_RACE_STAGGER
 }
 
 impl Default for ClientConfig {
@@ -73,16 +81,18 @@ impl Default for ClientConfig {
             transport: TransportProtocol::WebSocket,
             transports: None,
             protocol_urls: None,
-            race_timeout: Some(Duration::from_secs(5)),
+            race_stagger: default_race_stagger(),
             // 默认使用 JSON 序列化，不压缩（客户端可以在协商时指定首选格式）
             serialization_format: SerializationFormat::Json,
             compression: CompressionAlgorithm::None,
             force_serialization_format: None,
             force_compression: None,
-            connect_timeout: Duration::from_secs(30),
-            reconnect_interval: Duration::from_secs(5),
-            max_reconnect_attempts: Some(5),
-            reconnect_on_send: default_reconnect_on_send(),
+            connect_timeout: crate::client::race::DEFAULT_CONNECT_TIMEOUT,
+            connection_epoch: 0,
+            access_serial: 0,
+            ip_hints: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            doh: None,
             heartbeat: HeartbeatConfig::default(),
             tls: TlsConfig::none(),
             connection_id: None,
@@ -146,12 +156,11 @@ impl ClientConfig {
         self
     }
 
-    /// 启用多协议竞速
+    /// 设置交错竞速的协议优先序（见 [`Self::transports`]）。
     ///
-    /// 各协议同时建立网络连接，第一个建好的胜出并在它上面发 CONNECT，不等其余协议（包括排在前面、
-    /// 还没建好的协议），未选中的在后台中止或关闭。协议列表的顺序是发起顺序，也是日志与全部失败时
-    /// 错误信息里的编号。例如 UDP 被静默丢弃时，`with_protocol_race(vec![QUIC, WebSocket])` 经
-    /// WebSocket 连上，不等 QUIC 握手超时。整个竞速（含 CONNECT）受 [`Self::with_race_timeout`] 约束。
+    /// 例如 UDP 被静默丢弃时，`with_protocol_race(vec![QUIC, WebSocket])` 在交错间隔
+    /// （[`Self::with_race_stagger`]）后发起 WebSocket 并经它连上，不等 QUIC 握手超时；QUIC 在
+    /// 间隔内连上时根本不发起 WebSocket。
     pub fn with_protocol_race(mut self, protocols: Vec<TransportProtocol>) -> Self {
         self.transports = Some(protocols);
         self
@@ -190,9 +199,34 @@ impl ClientConfig {
         protocol.normalize_client_url(endpoint)
     }
 
-    /// 设置竞速超时时间
-    pub fn with_race_timeout(mut self, timeout: Duration) -> Self {
-        self.race_timeout = Some(timeout);
+    /// 设置交错竞速的间隔（见 [`Self::race_stagger`]）
+    pub fn with_race_stagger(mut self, stagger: Duration) -> Self {
+        self.race_stagger = stagger;
+        self
+    }
+
+    /// 设置这次建连的连接代数（见 [`Self::connection_epoch`]）
+    pub fn with_connection_epoch(mut self, epoch: u64) -> Self {
+        self.connection_epoch = epoch;
+        self
+    }
+
+    /// 设置上层当前接入清单的 serial（见 [`Self::access_serial`]）
+    pub fn with_access_serial(mut self, serial: u64) -> Self {
+        self.access_serial = serial;
+        self
+    }
+
+    /// 设置接入点的备用 IP（见 [`Self::ip_hints`]）
+    pub fn with_ip_hints(mut self, ip_hints: Vec<std::net::IpAddr>) -> Self {
+        self.ip_hints = ip_hints;
+        self
+    }
+
+    /// 设置 DoH 备用解析（见 [`Self::doh`]）
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_doh(mut self, doh: std::sync::Arc<crate::client::dial::DohCache>) -> Self {
+        self.doh = Some(doh);
         self
     }
 
@@ -208,27 +242,9 @@ impl ClientConfig {
         self
     }
 
-    /// 设置连接超时
+    /// 设置单个协议一次握手的时限（见 [`Self::connect_timeout`]）
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
-        self
-    }
-
-    /// 设置重连间隔
-    pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
-        self.reconnect_interval = interval;
-        self
-    }
-
-    /// 设置最大重连次数（None 表示无限重连）
-    pub fn with_max_reconnect_attempts(mut self, max: Option<u32>) -> Self {
-        self.max_reconnect_attempts = max;
-        self
-    }
-
-    /// 设置断开后发送时是否由客户端自己重连（见 [`Self::reconnect_on_send`]）
-    pub fn with_reconnect_on_send(mut self, enabled: bool) -> Self {
-        self.reconnect_on_send = enabled;
         self
     }
 
@@ -279,18 +295,21 @@ impl ClientConfig {
             .unwrap_or_else(|| self.compression.clone())
     }
 
-    /// 获取要使用的协议列表
+    /// 要依次尝试的协议（交错竞速的优先序；没设置时只有 `transport` 一个）
     pub fn get_protocols(&self) -> Vec<TransportProtocol> {
-        if let Some(ref protocols) = self.transports {
-            protocols.clone()
-        } else {
-            vec![self.transport]
+        match &self.transports {
+            Some(protocols) if !protocols.is_empty() => protocols.clone(),
+            _ => vec![self.transport],
         }
     }
 
-    /// 是否启用协议竞速
-    pub fn is_race_mode(&self) -> bool {
-        self.transports.is_some() && self.transports.as_ref().unwrap().len() > 1
+    /// 交错竞速参数
+    pub(crate) fn race_params(&self) -> crate::client::race::RaceParams {
+        crate::client::race::RaceParams {
+            order: self.get_protocols(),
+            stagger: self.race_stagger,
+            connect_timeout: self.connect_timeout,
+        }
     }
 }
 

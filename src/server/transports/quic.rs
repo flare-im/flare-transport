@@ -7,7 +7,9 @@ use crate::common::shutdown::SERVER_SHUTDOWN_REASON;
 use crate::server::config::ServerConfig;
 use crate::server::connection::ConnectionManager;
 use crate::server::transports::Server;
-use crate::server::transports::common::{AcceptGate, ServerConnectionHelper};
+use crate::server::transports::common::{
+    AcceptGate, ServerConnectionHelper, overload_reply_limiter, reject_overloaded,
+};
 use crate::server::transports::server_core::ServerCore;
 use crate::transport::connection::Connection;
 use crate::transport::quic::QUICTransport;
@@ -164,6 +166,7 @@ impl Server for QUICServer {
         let is_running = Arc::clone(&self.is_running);
         let core = Arc::clone(&self.core);
         let handshake_limiter = Arc::new(Semaphore::new(config.max_handshake_concurrency.max(1)));
+        let overload_limiter = overload_reply_limiter(&config);
 
         tokio::spawn(async move {
             debug!("[QUIC Server] 开始监听连接");
@@ -185,6 +188,14 @@ impl Server for QUICServer {
                                 "[QUIC Server] 握手并发已满: {}",
                                 config.max_handshake_concurrency
                             );
+                            // 回一帧 OVERLOADED 再关；回绝名额也满了就直接丢弃
+                            if let Ok(reply) = Arc::clone(&overload_limiter).try_acquire_owned() {
+                                let config = config.clone();
+                                tokio::spawn(async move {
+                                    let _reply = reply;
+                                    reject_overloaded_quic(conn, &config).await;
+                                });
+                            }
                             continue;
                         }
                     };
@@ -253,20 +264,32 @@ impl Server for QUICServer {
     }
 }
 
+/// 握手闸门已满时回绝一条 QUIC 连接：完成握手、等客户端打开双向流，回一帧 OVERLOADED 再关。
+/// 客户端的帧要从这条流上读，只关连接它只能看到一个没有原因的失败。
+async fn reject_overloaded_quic(incoming: quinn::Incoming, config: &ServerConfig) {
+    let Ok(Ok(connection)) = timeout(config.handshake_timeout, incoming).await else {
+        return;
+    };
+    let accepted = timeout(config.handshake_timeout, connection.accept_bi()).await;
+    match accepted {
+        Ok(Ok((send, recv))) => {
+            let transport = QUICTransport::new(send, recv).with_connection(connection);
+            reject_overloaded(Box::new(transport), config).await;
+        }
+        _ => connection.close(0u32.into(), b"OVERLOADED"),
+    }
+}
+
 /// 处理 QUIC 连接（内部函数）
+///
+/// 连接数上限在 [`ServerConnectionHelper::setup_new_connection`] 里检查：超限时要在双向流上回一帧
+/// OVERLOADED，所以先接受双向流。
 async fn handle_quic_connection(
     connection: quinn::Connection,
     manager: Arc<ConnectionManager>,
     config: ServerConfig,
     core: Arc<ServerCore>,
 ) {
-    // 检查连接数限制
-    if manager.connection_count() >= config.max_connections {
-        debug!("[QUIC Server] 连接数限制已满: {}", config.max_connections);
-        connection.close(0u32.into(), b"limit exceeded");
-        return;
-    }
-
     // 接受双向流
     debug!("[QUIC Server] 等待客户端打开双向流");
     let (send, recv) = match timeout(config.handshake_timeout, connection.accept_bi()).await {

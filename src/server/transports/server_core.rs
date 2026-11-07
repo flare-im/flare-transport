@@ -48,6 +48,8 @@ pub struct ServerCore {
     auth_timeout: Duration,
     /// 停机宽限（从配置读取）
     shutdown_close_grace: Duration,
+    /// CONNECT_ACK 里报给客户端的固定接入信息（网关 ID、接入点 ID、心跳建议），从配置读取
+    connect_ack_static: ConnectAckStatic,
     /// 默认序列化格式（用于协商）
     default_serialization_format: SerializationFormat,
     /// 默认压缩算法（用于协商）
@@ -64,6 +66,28 @@ pub struct ServerCore {
     shared_processors: Vec<ArcMessageProcessor>,
     /// 按协商 profile 复用共享 pipeline，减少大量长连接的重复分配。
     pipeline_cache: Arc<tokio::sync::Mutex<HashMap<PipelineCacheKey, Arc<MessagePipeline>>>>,
+}
+
+/// CONNECT_ACK 里不随连接变化的接入信息
+#[derive(Debug, Clone, Default)]
+struct ConnectAckStatic {
+    gateway_id: Option<String>,
+    ap_id: Option<String>,
+    heartbeat_interval_hint_sec: Option<u32>,
+}
+
+impl ConnectAckStatic {
+    fn from_config(config: &ServerConfig) -> Self {
+        let heartbeat = &config.default_heartbeat;
+        Self {
+            gateway_id: config.gateway_id.clone(),
+            ap_id: config.ap_id.clone(),
+            heartbeat_interval_hint_sec: heartbeat
+                .enabled
+                .then(|| u32::try_from(heartbeat.interval.as_secs()).unwrap_or(u32::MAX))
+                .filter(|secs| *secs > 0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -89,6 +113,8 @@ struct ConnectionIdentity {
     tenant_id: Option<String>,
     /// 写入连接元数据的认证元数据
     metadata: Option<HashMap<String, String>>,
+    /// CONNECT_ACK 要报给这条连接的接入清单 serial
+    access_serial: u64,
 }
 
 impl ConnectionIdentity {
@@ -98,6 +124,7 @@ impl ConnectionIdentity {
             user_id: negotiation.user_id.clone(),
             tenant_id: negotiation.tenant_id.clone(),
             metadata: Some(HashMap::new()),
+            access_serial: 0,
         }
     }
 
@@ -190,6 +217,7 @@ impl ServerCore {
             auth_enabled: config.auth_enabled,
             auth_timeout: config.auth_timeout,
             shutdown_close_grace: config.shutdown_close_grace,
+            connect_ack_static: ConnectAckStatic::from_config(config),
             default_serialization_format: config.default_serialization_format,
             default_compression: config.default_compression.clone(),
             default_encryption: config.default_encryption.clone(),
@@ -318,6 +346,18 @@ impl ServerCore {
     /// 停机时下发 CLOSE 后等客户端自行断开的宽限（`ServerConfig::shutdown_close_grace`）
     pub fn shutdown_close_grace(&self) -> Duration {
         self.shutdown_close_grace
+    }
+
+    /// 本次握手要放进 CONNECT_ACK 的接入信息：服务端当前时间、接入清单 serial（按连接所属应用，
+    /// 由认证器给出）、心跳建议、网关与接入点 ID。
+    fn connect_ack_info(&self, access_serial: u64) -> crate::common::link::ConnectAckInfo {
+        crate::common::link::ConnectAckInfo {
+            server_time_ms: Some(crate::common::platform::wall_clock_ms()),
+            access_serial: Some(access_serial),
+            heartbeat_interval_hint_sec: self.connect_ack_static.heartbeat_interval_hint_sec,
+            gateway_id: self.connect_ack_static.gateway_id.clone(),
+            ap_id: self.connect_ack_static.ap_id.clone(),
+        }
     }
 
     /// 添加中间件（用于消息处理管道）
@@ -467,6 +507,23 @@ impl ServerCore {
         // 1. 解析协商信息
         let negotiation = negotiation::parse_connect_message(frame)?;
 
+        // 协议版本不被支持：在认证之前拒绝，客户端据此进入终态（需要升级），不必再走一遍认证。
+        // 没带版本的是这个字段出现之前的客户端，按当前版本处理。
+        if let Some(version) = negotiation.protocol_version.as_deref()
+            && !crate::common::constants::SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+        {
+            warn!(
+                "[ServerCore] 协议版本不被支持，拒绝 CONNECT: connection_id={}, protocol_version={}, supported={:?}",
+                connection_id,
+                version,
+                crate::common::constants::SUPPORTED_PROTOCOL_VERSIONS
+            );
+            return Err(crate::common::error::FlareError::localized(
+                crate::common::error::ErrorCode::ProtocolVersionMismatch,
+                crate::common::error::ErrorCode::ProtocolVersionMismatch.as_str(),
+            ));
+        }
+
         // 2. 确定最终使用的序列化格式、压缩算法和加密方式
         let (final_format, final_compression, final_encryption) =
             self.determine_negotiation_result(&negotiation);
@@ -523,6 +580,7 @@ impl ServerCore {
             final_compression.clone(),
             final_encryption.clone(),
             &conflict_connections,
+            identity.access_serial,
         );
 
         // 8. 创建基于协商结果的 MessageParser
@@ -559,7 +617,8 @@ impl ServerCore {
                 Err(e) => {
                     if let Some(
                         code @ (crate::common::error::ErrorCode::AuthenticationFailed
-                        | crate::common::error::ErrorCode::ServiceUnavailable),
+                        | crate::common::error::ErrorCode::ServiceUnavailable
+                        | crate::common::error::ErrorCode::ProtocolVersionMismatch),
                     ) = e.code()
                     {
                         Self::send_connect_rejection(&connection, connection_id, code, e.reason())
@@ -1072,6 +1131,7 @@ impl ServerCore {
                     );
                     Ok(ConnectionIdentity {
                         tenant_id: auth_result.tenant_id().map(str::to_owned),
+                        access_serial: auth_result.access_serial,
                         user_id: auth_result.user_id,
                         metadata: auth_result.user_metadata,
                     })
@@ -1253,8 +1313,12 @@ impl ServerCore {
         final_compression: CompressionAlgorithm,
         final_encryption: EncryptionAlgorithm,
         conflict_connections: &[String],
+        access_serial: u64,
     ) -> Frame {
         let mut ack_metadata = std::collections::HashMap::new();
+
+        self.connect_ack_info(access_serial)
+            .write_metadata(&mut ack_metadata);
 
         // 如果有冲突连接，通知客户端
         if !conflict_connections.is_empty() {
@@ -1580,6 +1644,204 @@ mod tests {
             assert_eq!(
                 system.metadata.get("code").map(Vec::as_slice),
                 Some(expected_code.as_str().as_bytes())
+            );
+        }
+    }
+
+    /// 记下被调用的次数，总是放行。
+    #[derive(Default)]
+    struct CountingAuthenticator(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Authenticator for CountingAuthenticator {
+        async fn authenticate(
+            &self,
+            _token: &str,
+            _connection_id: &str,
+            _device_info: Option<&crate::common::device::DeviceInfo>,
+            _metadata: Option<&HashMap<String, Vec<u8>>>,
+        ) -> Result<crate::server::auth::AuthResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::server::auth::AuthResult::failure(
+                "Token 无效或已过期".to_string(),
+            ))
+        }
+    }
+
+    /// 协议版本不被支持：在认证之前就以 PROTOCOL_VERSION_MISMATCH（3001）拒绝，ERROR 帧里的原因与
+    /// 类别都是它；支持的版本照常走认证。
+    #[tokio::test]
+    async fn an_unsupported_protocol_version_is_rejected_before_authentication() {
+        use crate::common::constants::metadata_keys;
+        use crate::common::error::ErrorCode;
+        use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
+        use crate::common::protocol::flare::core::commands::{command, system_command};
+
+        let authenticator = Arc::new(CountingAuthenticator::default());
+        let core = ServerCore::new(&ServerConfig::default().enable_auth(), None)
+            .with_authenticator(Some(authenticator.clone()));
+        let connect = |version: &str| {
+            frame_with_system_command(
+                crate::common::protocol::builder::connect(
+                    SerializationFormat::Json,
+                    HashMap::from([
+                        ("token".to_string(), b"t".to_vec()),
+                        (
+                            metadata_keys::PROTOCOL_VERSION.to_string(),
+                            version.as_bytes().to_vec(),
+                        ),
+                    ]),
+                ),
+                Reliability::AtLeastOnce,
+            )
+        };
+        let recording = || {
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connection: Arc<tokio::sync::Mutex<Box<dyn Connection>>> =
+                Arc::new(tokio::sync::Mutex::new(Box::new(RecordingConnection {
+                    sent: sent.clone(),
+                    last_active: monotonic_now(),
+                })));
+            (sent, connection)
+        };
+
+        let (sent, connection) = recording();
+        let error = core
+            .handle_connect_complete(&connect("9.9.9"), "c1", connection)
+            .await
+            .expect_err("an unsupported version is rejected");
+        assert_eq!(error.code(), Some(ErrorCode::ProtocolVersionMismatch));
+        assert_eq!(
+            authenticator.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the version is checked before authentication"
+        );
+        let frame = {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            PRE_NEGOTIATION_PARSER.parse(&sent[0]).expect("JSON frame")
+        };
+        let Some(command::Type::System(system)) = frame.command.and_then(|c| c.r#type) else {
+            panic!("system command expected");
+        };
+        assert_eq!(system.r#type, system_command::Type::Error as i32);
+        assert_eq!(system.message, "PROTOCOL_VERSION_MISMATCH");
+        assert_eq!(
+            system.metadata.get("code").map(Vec::as_slice),
+            Some(b"PROTOCOL_VERSION_MISMATCH".as_slice())
+        );
+
+        let (_, connection) = recording();
+        let error = core
+            .handle_connect_complete(
+                &connect(crate::common::constants::PROTOCOL_VERSION),
+                "c2",
+                connection,
+            )
+            .await
+            .expect_err("the token is rejected");
+        assert_eq!(error.code(), Some(ErrorCode::AuthenticationFailed));
+        assert_eq!(authenticator.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// CONNECT_ACK 带上服务端时间、清单 serial（没有认证器时是 0）、心跳建议、网关与接入点 ID；
+    /// 没配置的不带。
+    #[tokio::test]
+    async fn the_connect_ack_carries_the_access_info() {
+        use crate::common::link::ConnectAckInfo;
+        use crate::common::protocol::flare::core::commands::command;
+
+        let config = ServerConfig::default()
+            .with_gateway_id("gw-bj-1")
+            .with_ap_id("ap-bj-a");
+        let core = ServerCore::new(&config, None);
+        let connect = frame_with_system_command(
+            crate::common::protocol::builder::connect(SerializationFormat::Json, HashMap::new()),
+            Reliability::AtLeastOnce,
+        );
+        let ack_info = |frame: Frame| {
+            let Some(command::Type::System(system)) = frame.command.and_then(|c| c.r#type) else {
+                panic!("system command expected");
+            };
+            ConnectAckInfo::from_metadata(&system.metadata)
+        };
+
+        let before = crate::common::platform::wall_clock_ms();
+        let (ack, _) = core
+            .handle_connect_message(&connect, "c1")
+            .await
+            .expect("negotiated");
+        let info = ack_info(ack);
+        assert!(
+            info.server_time_ms.is_some_and(|ms| ms >= before),
+            "{info:?}"
+        );
+        assert_eq!(info.access_serial, Some(0));
+        assert_eq!(
+            info.heartbeat_interval_hint_sec,
+            Some(config.default_heartbeat.interval.as_secs() as u32)
+        );
+        assert_eq!(info.gateway_id.as_deref(), Some("gw-bj-1"));
+        assert_eq!(info.ap_id.as_deref(), Some("ap-bj-a"));
+
+        let bare = ServerCore::new(&ServerConfig::default(), None);
+        let (ack, _) = bare
+            .handle_connect_message(&connect, "c2")
+            .await
+            .expect("negotiated");
+        let info = ack_info(ack);
+        assert_eq!(info.gateway_id, None);
+        assert_eq!(info.ap_id, None);
+    }
+
+    /// 按租户给 serial 的认证器：两个应用共用一个网关，各自的连接只看到自己应用的 serial。
+    struct AppSerials;
+
+    #[async_trait]
+    impl Authenticator for AppSerials {
+        async fn authenticate(
+            &self,
+            token: &str,
+            _connection_id: &str,
+            _device_info: Option<&crate::common::device::DeviceInfo>,
+            _metadata: Option<&HashMap<String, Vec<u8>>>,
+        ) -> Result<crate::server::auth::AuthResult> {
+            let serial = if token == "app-a" { 42 } else { 7 };
+            Ok(
+                crate::server::auth::AuthResult::success(Some(format!("user-{token}")))
+                    .with_tenant_id(token)
+                    .with_access_serial(serial),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connect_ack_reports_the_serial_of_the_connection_app() {
+        use crate::common::link::ConnectAckInfo;
+        use crate::common::protocol::flare::core::commands::command;
+
+        let mut config = ServerConfig::default();
+        config.auth_enabled = true;
+        let core = ServerCore::new(&config, None).with_authenticator(Some(Arc::new(AppSerials)));
+        for (token, serial) in [("app-a", 42), ("app-b", 7)] {
+            let connect = frame_with_system_command(
+                crate::common::protocol::builder::connect(
+                    SerializationFormat::Json,
+                    HashMap::from([("token".to_string(), token.as_bytes().to_vec())]),
+                ),
+                Reliability::AtLeastOnce,
+            );
+            let (ack, _) = core
+                .handle_connect_message(&connect, token)
+                .await
+                .expect("negotiated");
+            let Some(command::Type::System(system)) = ack.command.and_then(|c| c.r#type) else {
+                panic!("system command expected");
+            };
+            assert_eq!(
+                ConnectAckInfo::from_metadata(&system.metadata).access_serial,
+                Some(serial),
+                "{token}"
             );
         }
     }

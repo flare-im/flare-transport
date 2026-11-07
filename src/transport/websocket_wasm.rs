@@ -91,12 +91,13 @@ impl WebSocketTransport {
         let observers = Arc::new(StdMutex::new(Vec::new()));
         let last_active = Arc::new(StdMutex::new(monotonic_now()));
 
-        let (open_tx, open_rx) = tokio::sync::oneshot::channel::<()>();
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+        let opening = Arc::new(StdMutex::new(Some(open_tx)));
         {
-            let open_slot = std::cell::RefCell::new(Some(open_tx));
+            let opening = Arc::clone(&opening);
             let onopen = Closure::wrap(Box::new(move || {
-                if let Some(tx) = open_slot.borrow_mut().take() {
-                    let _ = tx.send(());
+                if let Some(tx) = opening.lock().ok().and_then(|mut slot| slot.take()) {
+                    let _ = tx.send(Ok(()));
                 }
             }) as Box<dyn FnMut()>);
             ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
@@ -135,12 +136,17 @@ impl WebSocketTransport {
 
         {
             let observers = Arc::clone(&observers);
+            let opening = Arc::clone(&opening);
             let onclose = Closure::wrap(Box::new(move |event: CloseEvent| {
                 let reason = if event.reason().is_empty() {
                     "Connection closed".to_string()
                 } else {
                     event.reason()
                 };
+                if let Some(tx) = opening.lock().ok().and_then(|mut slot| slot.take()) {
+                    let _ = tx.send(Err(FlareError::connection_failed(reason)));
+                    return;
+                }
                 Self::dispatch_observers_and_clear(
                     &observers,
                     &ConnectionEvent::Disconnected(reason),
@@ -153,6 +159,12 @@ impl WebSocketTransport {
         {
             let observers = Arc::clone(&observers);
             let onerror = Closure::wrap(Box::new(move |_event: ErrorEvent| {
+                if let Some(tx) = opening.lock().ok().and_then(|mut slot| slot.take()) {
+                    let _ = tx.send(Err(FlareError::connection_failed(
+                        "WebSocket error before opening".to_string(),
+                    )));
+                    return;
+                }
                 Self::dispatch_observers_and_clear(
                     &observers,
                     &ConnectionEvent::Error(FlareError::connection_failed(
@@ -164,12 +176,23 @@ impl WebSocketTransport {
             onerror.forget();
         }
 
-        timeout(std::time::Duration::from_secs(30), open_rx)
+        let result = timeout(std::time::Duration::from_secs(30), open_rx)
             .await
-            .map_err(|_| FlareError::connection_timeout("WebSocket open timeout".to_string()))?
-            .map_err(|_| {
-                FlareError::connection_failed("WebSocket open channel closed".to_string())
-            })?;
+            .map_err(|_| FlareError::connection_timeout("WebSocket open timeout".to_string()))
+            .and_then(|result| {
+                result.map_err(|_| {
+                    FlareError::connection_failed("WebSocket open channel closed".to_string())
+                })
+            })
+            .and_then(|result| result);
+        ws.set_onopen(None);
+        if let Err(error) = result {
+            ws.set_onmessage(None);
+            ws.set_onclose(None);
+            ws.set_onerror(None);
+            ws.close();
+            return Err(error);
+        }
         web_sys::console::log_1(&"[flare-core] WebSocket onopen received".into());
 
         Ok(Self {

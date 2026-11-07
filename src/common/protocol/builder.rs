@@ -248,32 +248,6 @@ pub fn event(
     )
 }
 
-/// 创建 AUTH 命令
-pub fn auth(metadata: HashMap<String, Vec<u8>>, data: Option<Vec<u8>>) -> SystemCommand {
-    SystemCommand {
-        r#type: SystemType::Auth as i32,
-        format: SerializationFormat::Protobuf as i32,
-        message: String::new(),
-        metadata,
-        data: data.unwrap_or_default(),
-        compression: String::new(),
-        encryption: String::new(),
-    }
-}
-
-/// 创建 AUTH_ACK 命令
-pub fn auth_ack(
-    message: Option<String>,
-    metadata: Option<HashMap<String, Vec<u8>>>,
-) -> SystemCommand {
-    create_system_command_with_message(
-        SystemType::AuthAck,
-        SerializationFormat::Protobuf,
-        message.unwrap_or_default(),
-        metadata,
-    )
-}
-
 /// 创建 KICKED 命令（被踢下线）
 ///
 /// # 参数

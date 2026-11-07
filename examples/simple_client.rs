@@ -148,9 +148,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         })
         // 配置心跳
         .with_heartbeat(heartbeat_config)
-        // 配置重连
-        .with_reconnect_interval(Duration::from_secs(3))
-        .with_max_reconnect_attempts(Some(5))
         // 配置连接超时
         .with_connect_timeout(Duration::from_secs(10))
         // 可选：启用消息路由（如果需要路由功能）
