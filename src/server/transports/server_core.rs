@@ -615,7 +615,18 @@ impl ServerCore {
             match self.handle_connect_message(frame, connection_id).await {
                 Ok(negotiated) => negotiated,
                 Err(e) => {
-                    if let Some(
+                    if e.code() == Some(crate::common::error::ErrorCode::UpgradeRequired) {
+                        let (min_build, release_hint) = upgrade_required_details(&e);
+                        Self::send_connect_rejection_command(
+                            &connection,
+                            connection_id,
+                            crate::common::link::upgrade_required_command(
+                                min_build,
+                                release_hint.as_deref(),
+                            ),
+                        )
+                        .await;
+                    } else if let Some(
                         code @ (crate::common::error::ErrorCode::AuthenticationFailed
                         | crate::common::error::ErrorCode::ServiceUnavailable
                         | crate::common::error::ErrorCode::ProtocolVersionMismatch),
@@ -760,7 +771,6 @@ impl ServerCore {
         code: crate::common::error::ErrorCode,
         reason: &str,
     ) {
-        use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
         let code = code.as_str();
         let message = if is_typed_reason(reason) {
             reason
@@ -768,10 +778,22 @@ impl ServerCore {
             code
         };
         let metadata = HashMap::from([("code".to_string(), code.as_bytes().to_vec())]);
-        let frame = frame_with_system_command(
+        Self::send_connect_rejection_command(
+            connection,
+            connection_id,
             crate::common::protocol::builder::error(message.to_string(), Some(metadata)),
-            Reliability::BestEffort,
-        );
+        )
+        .await;
+    }
+
+    /// 把一条拒绝 CONNECT 的系统命令编码成协商前 JSON 帧直接写给连接，有超时。
+    async fn send_connect_rejection_command(
+        connection: &Arc<tokio::sync::Mutex<Box<dyn crate::transport::connection::Connection>>>,
+        connection_id: &str,
+        command: crate::common::protocol::SystemCommand,
+    ) {
+        use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
+        let frame = frame_with_system_command(command, Reliability::BestEffort);
         let data = match PRE_NEGOTIATION_PARSER.serialize(&frame) {
             Ok(data) => data,
             Err(e) => {
@@ -1135,6 +1157,14 @@ impl ServerCore {
                         user_id: auth_result.user_id,
                         metadata: auth_result.user_metadata,
                     })
+                } else if let Some(upgrade) = auth_result.upgrade_required {
+                    // 版本门禁：客户端构建过低或被阻断。这是终止类拒绝，客户端进入强制更新，
+                    // 不能报成鉴权失败（会去换令牌）或服务不可用（会退避重连）。
+                    info!(
+                        "[ServerCore] 客户端构建需要升级，拒绝连接: connection_id={}, min_build={}",
+                        connection_id, upgrade.min_build
+                    );
+                    Err(upgrade_required_error(&upgrade))
                 } else if auth_result.retryable {
                     // 认证依赖暂时不可用（如租户状态读不到）：不是对令牌或租户的结论。按服务不可用拒绝，
                     // 客户端退避重连；报成鉴权失败会让客户端去换令牌，报成租户不可用会让它终止会话。
@@ -1377,6 +1407,47 @@ impl ServerHandle for ServerCore {
 
 /// 拒绝帧最多等这么久；对端不读也不能拖住关连接。
 const CONNECT_REJECTION_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 版本门禁拒绝转成错误：`UPGRADE_REQUIRED`，`min_build` 与 `release_hint` 放进 `params`，
+/// 发拒绝帧时再从里面取回（见 [`upgrade_required_details`]）。
+fn upgrade_required_error(
+    upgrade: &crate::server::auth::UpgradeRequired,
+) -> crate::common::error::FlareError {
+    use crate::common::constants::metadata_keys;
+    let mut params = HashMap::from([(
+        metadata_keys::MIN_BUILD.to_string(),
+        upgrade.min_build.to_string(),
+    )]);
+    if let Some(hint) = &upgrade.release_hint {
+        params.insert(metadata_keys::RELEASE_HINT.to_string(), hint.clone());
+    }
+    crate::common::error::FlareError::Localized {
+        code: crate::common::error::ErrorCode::UpgradeRequired,
+        reason: crate::common::error::ErrorCode::UpgradeRequired
+            .as_str()
+            .to_string(),
+        details: None,
+        params: Some(params),
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// 从 [`upgrade_required_error`] 造出的错误里取回最低构建号与升级说明
+fn upgrade_required_details(error: &crate::common::error::FlareError) -> (u64, Option<String>) {
+    use crate::common::constants::metadata_keys;
+    let params = match error {
+        crate::common::error::FlareError::Localized {
+            params: Some(params),
+            ..
+        } => params,
+        _ => return (0, None),
+    };
+    let min_build = params
+        .get(metadata_keys::MIN_BUILD)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    (min_build, params.get(metadata_keys::RELEASE_HINT).cloned())
+}
 
 /// 认证器给出的失败原因是否为可下发的类型化错误码：大写字母开头，只含大写字母、数字、下划线。
 fn is_typed_reason(reason: &str) -> bool {
@@ -1646,6 +1717,56 @@ mod tests {
                 Some(expected_code.as_str().as_bytes())
             );
         }
+    }
+
+    /// 版本门禁拒绝以 UPGRADE_REQUIRED 下发，带最低构建号与升级说明；客户端把它读成终止类拒绝，
+    /// 而不是鉴权失败或服务不可用。
+    #[tokio::test]
+    async fn upgrade_rejection_reaches_the_client_as_upgrade_required() {
+        use crate::common::ServerRejection;
+        use crate::common::error::ErrorCode;
+        use crate::common::message::parser::PRE_NEGOTIATION_PARSER;
+        use crate::common::protocol::flare::core::commands::command;
+        use crate::server::auth::AuthResult;
+
+        let config = ServerConfig::default().enable_auth();
+        let core = ServerCore::new(&config, None).with_authenticator(Some(Arc::new(Reject(
+            AuthResult::upgrade_required(30_201, Some("https://example.com/download".to_string())),
+        ))));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connection: Arc<tokio::sync::Mutex<Box<dyn Connection>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(RecordingConnection {
+                sent: sent.clone(),
+                last_active: monotonic_now(),
+            })));
+        let connect = frame_with_system_command(
+            crate::common::protocol::builder::connect(
+                SerializationFormat::Json,
+                HashMap::from([("token".to_string(), b"t".to_vec())]),
+            ),
+            Reliability::AtLeastOnce,
+        );
+
+        let error = core
+            .handle_connect_complete(&connect, "c1", connection)
+            .await
+            .expect_err("CONNECT must be rejected");
+        assert_eq!(error.code(), Some(ErrorCode::UpgradeRequired), "{error}");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly the rejection frame, no CONNECT_ACK");
+        let frame = PRE_NEGOTIATION_PARSER.parse(&sent[0]).expect("JSON frame");
+        let Some(command::Type::System(system)) = frame.command.and_then(|c| c.r#type) else {
+            panic!("system command expected");
+        };
+        let rejection = ServerRejection::from_command(&system);
+        assert_eq!(rejection.code, ErrorCode::UpgradeRequired);
+        assert_eq!(rejection.min_build, Some(30_201));
+        assert_eq!(
+            rejection.release_hint.as_deref(),
+            Some("https://example.com/download")
+        );
+        assert!(rejection.is_terminal());
     }
 
     /// 记下被调用的次数，总是放行。

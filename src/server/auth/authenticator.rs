@@ -13,6 +13,17 @@ use async_trait::async_trait;
 /// 并把同一个值写进连接元数据，业务层读到的连接租户与设备分桶用的租户始终一致。
 pub const TENANT_ID_METADATA_KEY: &str = "tenant_id";
 
+/// 客户端构建低于租户允许的范围：CONNECT 以 `UPGRADE_REQUIRED` 拒绝
+///
+/// 客户端收到后进入强制更新，不重连、不换令牌。见 [`AuthResult::upgrade_required`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeRequired {
+    /// 客户端至少要升级到的构建号
+    pub min_build: u64,
+    /// 升级说明（例如下载页地址），没有时为 `None`
+    pub release_hint: Option<String>,
+}
+
 /// 认证结果
 #[derive(Debug, Clone)]
 pub struct AuthResult {
@@ -33,6 +44,11 @@ pub struct AuthResult {
     pub retryable: bool,
     /// 这条连接所属应用的最新接入清单 serial，随 CONNECT_ACK 下发；0 表示服务端不知道
     pub access_serial: u64,
+    /// 版本门禁的拒绝（只在 `authenticated == false` 时有意义）
+    ///
+    /// 有值时服务端以 `UPGRADE_REQUIRED` 拒绝 CONNECT，带上 `min_build` 与 `release_hint`；
+    /// 优先于 `retryable` 与一般鉴权失败。
+    pub upgrade_required: Option<UpgradeRequired>,
 }
 
 impl AuthResult {
@@ -45,6 +61,7 @@ impl AuthResult {
             user_metadata: None,
             retryable: false,
             access_serial: 0,
+            upgrade_required: None,
         }
     }
 
@@ -60,6 +77,7 @@ impl AuthResult {
             user_metadata: Some(metadata),
             retryable: false,
             access_serial: 0,
+            upgrade_required: None,
         }
     }
 
@@ -72,6 +90,7 @@ impl AuthResult {
             user_metadata: None,
             retryable: false,
             access_serial: 0,
+            upgrade_required: None,
         }
     }
 
@@ -84,6 +103,24 @@ impl AuthResult {
         Self {
             retryable: true,
             ..Self::failure(error_message)
+        }
+    }
+
+    /// 创建版本门禁拒绝：客户端构建过低或被阻断，必须升级
+    ///
+    /// 服务端以 `UPGRADE_REQUIRED` 拒绝 CONNECT，ERROR 帧 metadata 带 `min_build` 与
+    /// `release_hint`，客户端据此进入强制更新并停止重连。
+    pub fn upgrade_required(min_build: u64, release_hint: Option<String>) -> Self {
+        Self {
+            upgrade_required: Some(UpgradeRequired {
+                min_build,
+                release_hint,
+            }),
+            ..Self::failure(
+                crate::common::error::ErrorCode::UpgradeRequired
+                    .as_str()
+                    .to_string(),
+            )
         }
     }
 
@@ -173,10 +210,27 @@ mod tests {
         );
 
         assert!(!AuthResult::failure("TENANT_UNAVAILABLE".to_string()).retryable);
+        assert!(!AuthResult::upgrade_required(7, None).retryable);
         assert!(!AuthResult::success(Some("u".to_string())).retryable);
         assert!(
             !AuthResult::success_with_metadata(Some("u".to_string()), Default::default()).retryable
         );
+    }
+
+    #[test]
+    fn an_upgrade_rejection_carries_the_minimum_build() {
+        let result = AuthResult::upgrade_required(30_201, Some("https://example.com".to_string()));
+        assert!(!result.authenticated);
+        assert_eq!(result.error_message.as_deref(), Some("UPGRADE_REQUIRED"));
+        assert_eq!(
+            result.upgrade_required,
+            Some(UpgradeRequired {
+                min_build: 30_201,
+                release_hint: Some("https://example.com".to_string()),
+            })
+        );
+        assert_eq!(AuthResult::failure("x".to_string()).upgrade_required, None);
+        assert_eq!(AuthResult::success(None).upgrade_required, None);
     }
 
     #[test]
