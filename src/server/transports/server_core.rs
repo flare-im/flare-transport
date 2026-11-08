@@ -611,33 +611,53 @@ impl ServerCore {
         connection: Arc<tokio::sync::Mutex<Box<dyn crate::transport::connection::Connection>>>,
     ) -> Result<()> {
         // 1. 处理协商（但不立即标记协商完成，等 CONNECT_ACK 发送完成后再标记）
-        let (ack_frame, negotiation_parser) =
-            match self.handle_connect_message(frame, connection_id).await {
-                Ok(negotiated) => negotiated,
-                Err(e) => {
-                    if e.code() == Some(crate::common::error::ErrorCode::UpgradeRequired) {
-                        let (min_build, release_hint) = upgrade_required_details(&e);
-                        Self::send_connect_rejection_command(
-                            &connection,
-                            connection_id,
-                            crate::common::link::upgrade_required_command(
-                                min_build,
-                                release_hint.as_deref(),
-                            ),
-                        )
-                        .await;
-                    } else if let Some(
-                        code @ (crate::common::error::ErrorCode::AuthenticationFailed
-                        | crate::common::error::ErrorCode::ServiceUnavailable
-                        | crate::common::error::ErrorCode::ProtocolVersionMismatch),
-                    ) = e.code()
-                    {
-                        Self::send_connect_rejection(&connection, connection_id, code, e.reason())
+        let (ack_frame, negotiation_parser) = match self
+            .handle_connect_message(frame, connection_id)
+            .await
+        {
+            Ok(negotiated) => negotiated,
+            Err(e) => {
+                if e.code() == Some(crate::common::error::ErrorCode::UpgradeRequired) {
+                    match upgrade_required_details(&e) {
+                        Some((min_build, release_hint)) => {
+                            Self::send_connect_rejection_command(
+                                &connection,
+                                connection_id,
+                                crate::common::link::upgrade_required_command(
+                                    min_build,
+                                    release_hint.as_deref(),
+                                ),
+                            )
                             .await;
+                        }
+                        // 认不出最低构建号就不编一个 0 出来：只发不带构建号的 UPGRADE_REQUIRED，
+                        // 客户端照样终止，目标构建号从发布清单拿。
+                        None => {
+                            warn!(
+                                "[ServerCore] UPGRADE_REQUIRED without a readable min_build: connection_id={}",
+                                connection_id
+                            );
+                            Self::send_connect_rejection(
+                                &connection,
+                                connection_id,
+                                crate::common::error::ErrorCode::UpgradeRequired,
+                                e.reason(),
+                            )
+                            .await;
+                        }
                     }
-                    return Err(e);
+                } else if let Some(
+                    code @ (crate::common::error::ErrorCode::AuthenticationFailed
+                    | crate::common::error::ErrorCode::ServiceUnavailable
+                    | crate::common::error::ErrorCode::ProtocolVersionMismatch),
+                ) = e.code()
+                {
+                    Self::send_connect_rejection(&connection, connection_id, code, e.reason())
+                        .await;
                 }
-            };
+                return Err(e);
+            }
+        };
 
         // 记录最终协商结果
         let final_format = negotiation_parser.default_format();
@@ -1432,21 +1452,21 @@ fn upgrade_required_error(
     }
 }
 
-/// 从 [`upgrade_required_error`] 造出的错误里取回最低构建号与升级说明
-fn upgrade_required_details(error: &crate::common::error::FlareError) -> (u64, Option<String>) {
+/// 从 [`upgrade_required_error`] 造出的错误里取回最低构建号与升级说明。没有参数、缺最低构建号或
+/// 它不是十进制整数时返回 `None`（不静默当成 0）。
+fn upgrade_required_details(
+    error: &crate::common::error::FlareError,
+) -> Option<(u64, Option<String>)> {
     use crate::common::constants::metadata_keys;
-    let params = match error {
-        crate::common::error::FlareError::Localized {
-            params: Some(params),
-            ..
-        } => params,
-        _ => return (0, None),
+    let crate::common::error::FlareError::Localized {
+        params: Some(params),
+        ..
+    } = error
+    else {
+        return None;
     };
-    let min_build = params
-        .get(metadata_keys::MIN_BUILD)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    (min_build, params.get(metadata_keys::RELEASE_HINT).cloned())
+    let min_build = params.get(metadata_keys::MIN_BUILD)?.parse().ok()?;
+    Some((min_build, params.get(metadata_keys::RELEASE_HINT).cloned()))
 }
 
 /// 认证器给出的失败原因是否为可下发的类型化错误码：大写字母开头，只含大写字母、数字、下划线。
@@ -1717,6 +1737,39 @@ mod tests {
                 Some(expected_code.as_str().as_bytes())
             );
         }
+    }
+
+    #[test]
+    fn upgrade_details_are_not_invented_when_the_floor_is_unreadable() {
+        use crate::common::constants::metadata_keys;
+        let upgrade = crate::server::auth::UpgradeRequired {
+            min_build: 20302,
+            release_hint: Some("https://example.com/download".to_string()),
+        };
+        assert_eq!(
+            upgrade_required_details(&upgrade_required_error(&upgrade)),
+            Some((20302, Some("https://example.com/download".to_string())))
+        );
+        let with_params =
+            |params: Option<HashMap<String, String>>| crate::common::error::FlareError::Localized {
+                code: crate::common::error::ErrorCode::UpgradeRequired,
+                reason: "UPGRADE_REQUIRED".to_string(),
+                details: None,
+                params,
+                timestamp: chrono::Utc::now(),
+            };
+        assert_eq!(upgrade_required_details(&with_params(None)), None);
+        assert_eq!(
+            upgrade_required_details(&with_params(Some(HashMap::new()))),
+            None
+        );
+        assert_eq!(
+            upgrade_required_details(&with_params(Some(HashMap::from([(
+                metadata_keys::MIN_BUILD.to_string(),
+                "20x".to_string()
+            )])))),
+            None
+        );
     }
 
     /// 版本门禁拒绝以 UPGRADE_REQUIRED 下发，带最低构建号与升级说明；客户端把它读成终止类拒绝，
