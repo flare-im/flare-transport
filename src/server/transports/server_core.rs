@@ -1941,8 +1941,10 @@ mod tests {
         use crate::common::link::ConnectAckInfo;
         use crate::common::protocol::flare::core::commands::command;
 
-        let mut config = ServerConfig::default();
-        config.auth_enabled = true;
+        let config = ServerConfig {
+            auth_enabled: true,
+            ..Default::default()
+        };
         let core = ServerCore::new(&config, None).with_authenticator(Some(Arc::new(AppSerials)));
         for (token, serial) in [("app-a", 42), ("app-b", 7)] {
             let connect = frame_with_system_command(
