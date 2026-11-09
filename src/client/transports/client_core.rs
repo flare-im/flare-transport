@@ -139,6 +139,9 @@ pub struct ClientCore {
     /// 协商完成后收到的计划性 CLOSE（排空、停机、再均衡）：随后的断开以它作为原因上报。
     /// 新连接建立时清除。
     server_close: Arc<StdMutex<Option<ServerClose>>>,
+    /// 协商完成后收到的终止类 ERROR（如在线连接被升级门槛拒绝的 `UPGRADE_REQUIRED`）：随后的断开以它
+    /// 作为原因上报，与协商前的拒绝同一类型。新连接建立时清除。
+    session_rejection: Arc<StdMutex<Option<ServerRejection>>>,
     /// 这条连接最近一次上报给观察者的断开原因（类型化）。
     disconnect_reason: DisconnectReasonCell,
     /// 竞速里等着交给胜出连接的上层绑定（见 [`LinkBinding`]）。
@@ -268,6 +271,7 @@ impl ClientCore {
             connect_ack: Arc::new(StdMutex::new(None)),
             rejection: Arc::new(StdMutex::new(None)),
             server_close: Arc::new(StdMutex::new(None)),
+            session_rejection: Arc::new(StdMutex::new(None)),
             disconnect_reason: Arc::new(StdMutex::new(None)),
             link_binding: Arc::new(StdMutex::new(BindingState::Unbound)),
             session_ended_by_server: Arc::new(StdMutex::new(None)),
@@ -821,12 +825,46 @@ impl ClientCore {
                 self.record_connect_rejection(sys_cmd);
                 true
             }
+            // 协商完成后的 ERROR：终止类拒绝（升级门槛等）登记并关连接；其余照旧交给后续处理
+            SystemCommandType::Error if negotiated_at_receipt => {
+                self.handle_session_error_command(sys_cmd).await;
+                false
+            }
             SystemCommandType::Close => {
                 self.handle_close_command(frame, sys_cmd, negotiated_at_receipt)
                     .await;
                 true
             }
             _ => false,
+        }
+    }
+
+    /// 协商完成后收到的 ERROR：只有终止类拒绝（[`ServerRejection::is_terminal`]，如服务端抬高版本门槛后
+    /// 对在线连接下发的 `UPGRADE_REQUIRED`）才登记并关连接，随后的断开以 [`DisconnectReason::Rejected`]
+    /// 上报，引擎据此与协商前的拒绝一样终止并提示升级。非终止类 ERROR 不处理，行为不变。
+    async fn handle_session_error_command(&self, sys_cmd: &crate::common::protocol::SystemCommand) {
+        let rejection = ServerRejection::from_command(sys_cmd);
+        if !rejection.is_terminal() {
+            return;
+        }
+        let detail = format!("{}: server rejected the session", rejection.reason);
+        match self.session_rejection.lock() {
+            Ok(mut stored) => {
+                if stored.is_some() {
+                    return;
+                }
+                tracing::warn!("[ClientCore] session rejected by server: {}", detail);
+                *stored = Some(rejection);
+            }
+            Err(_) => return,
+        }
+        let Some(connection) = self.take_client_connection() else {
+            tracing::debug!("[ClientCore] terminal ERROR received without an active connection");
+            return;
+        };
+        let mut conn = connection.lock().await;
+        if let Err(e) = conn.close_with_reason(&detail).await {
+            tracing::debug!("[ClientCore] closing after terminal ERROR failed: {}", e);
         }
     }
 
@@ -1295,6 +1333,9 @@ impl ClientCore {
         if let Ok(mut close) = self.server_close.lock() {
             *close = None;
         }
+        if let Ok(mut rejection) = self.session_rejection.lock() {
+            *rejection = None;
+        }
         if let Ok(mut reason) = self.disconnect_reason.lock() {
             *reason = None;
         }
@@ -1320,6 +1361,23 @@ impl ClientCore {
                 if requested =>
             {
                 DisconnectReason::ClientRequested
+            }
+            (CloseReport::AsIs, ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_))
+                if self
+                    .session_rejection
+                    .lock()
+                    .ok()
+                    .is_some_and(|rejection| rejection.is_some()) =>
+            {
+                match self
+                    .session_rejection
+                    .lock()
+                    .ok()
+                    .and_then(|rejection| rejection.clone())
+                {
+                    Some(rejection) => DisconnectReason::Rejected(rejection),
+                    None => return,
+                }
             }
             (CloseReport::AsIs, ConnectionEvent::Disconnected(detail)) => {
                 match self
@@ -1737,6 +1795,51 @@ mod client_core_tests {
                 CloseKind::ServerShutdown
             )))
         );
+    }
+
+    /// 协商完成后的终止类 ERROR（升级门槛）以类型化拒绝上报；非终止类 ERROR 不改变断开原因。
+    #[tokio::test]
+    async fn a_terminal_error_after_negotiation_is_reported_as_a_rejection() {
+        use crate::common::error::ErrorCode;
+        use crate::common::link::upgrade_required_command;
+        let mut core = ClientCore::new(&ClientConfig::default());
+        core.set_client_connection(Arc::new(Mutex::new(
+            Box::new(MockConnection) as Box<dyn Connection>
+        )));
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.update_parser(
+            SerializationFormat::Json,
+            CompressionAlgorithm::None,
+            EncryptionAlgorithm::None,
+        )
+        .await;
+        core.stop_heartbeat();
+
+        let command = upgrade_required_command(30_201, Some("https://example.com/download"));
+        core.handle_session_error_command(&command).await;
+        core.handle_connection_event(&ConnectionEvent::Disconnected(
+            "UPGRADE_REQUIRED: server rejected the session".to_string(),
+        ));
+        let Some(DisconnectReason::Rejected(rejection)) = core.last_disconnect_reason() else {
+            panic!("expected a rejection");
+        };
+        assert_eq!(rejection.code, ErrorCode::UpgradeRequired);
+        assert_eq!(rejection.min_build, Some(30_201));
+        assert!(rejection.is_terminal());
+
+        // 新连接清除；非终止类 ERROR（过载）不登记，断开仍按文本归类。
+        core.handle_connection_event(&ConnectionEvent::Connected);
+        core.handle_session_error_command(&crate::common::link::overloaded_command(
+            Duration::from_millis(500),
+        ))
+        .await;
+        core.handle_connection_event(&ConnectionEvent::Disconnected(
+            "Stream closed by peer".to_string(),
+        ));
+        assert!(matches!(
+            core.last_disconnect_reason(),
+            Some(DisconnectReason::PeerClosed { .. })
+        ));
     }
 
     /// 心跳判死、对端关闭、读写出错、主动断开各自归类。

@@ -273,6 +273,9 @@ pub enum DisconnectReason {
     ClientRequested,
     /// 服务端计划性关闭（排空、停机、再均衡），带建议的重连窗口与优先接入点；不计熔断。
     ServerClose(ServerClose),
+    /// 协商完成后服务端以终止类拒绝关闭在线连接（如抬高版本门槛后的 `UPGRADE_REQUIRED`）：与建连时
+    /// 被拒同一类型，只能由用户动作恢复，不要自动重连。
+    Rejected(ServerRejection),
     /// 被服务端踢下线。
     Kicked {
         /// KICKED 的类型化原因（如 `DEVICE_CONFLICT`、`TENANT_UNAVAILABLE`）
@@ -304,6 +307,14 @@ impl DisconnectReason {
                 | DisconnectReason::PeerClosed { .. }
                 | DisconnectReason::TransportError { .. }
         )
+    }
+
+    /// 终止类拒绝（若是）。
+    pub fn rejection(&self) -> Option<&ServerRejection> {
+        match self {
+            DisconnectReason::Rejected(rejection) => Some(rejection),
+            _ => None,
+        }
     }
 
     /// 服务端计划性关闭（若是）。
@@ -347,6 +358,9 @@ impl fmt::Display for DisconnectReason {
             DisconnectReason::ClientRequested => f.write_str(CLIENT_DISCONNECTED_REASON),
             DisconnectReason::ServerClose(close) => {
                 write!(f, "{}: server closed the connection", close.kind.as_str())
+            }
+            DisconnectReason::Rejected(rejection) => {
+                write!(f, "{}: server rejected the session", rejection.reason)
             }
             DisconnectReason::Kicked { reason, .. } => f.write_str(reason),
             DisconnectReason::HeartbeatTimeout => {
@@ -464,6 +478,13 @@ mod tests {
             .to_string(),
             "DEVICE_CONFLICT"
         );
+        let upgrade =
+            DisconnectReason::Rejected(ServerRejection::classify("UPGRADE_REQUIRED", None));
+        assert_eq!(
+            upgrade.to_string(),
+            "UPGRADE_REQUIRED: server rejected the session"
+        );
+        assert!(!upgrade.counts_against_access_point());
         let shutdown = DisconnectReason::ServerClose(ServerClose::new(CloseKind::ServerShutdown));
         assert_eq!(
             shutdown.to_string(),
