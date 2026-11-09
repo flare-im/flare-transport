@@ -1654,6 +1654,7 @@ impl Clone for ClientCore {
             disconnect_requested: Arc::clone(&self.disconnect_requested),
             connect_ack: Arc::clone(&self.connect_ack),
             rejection: Arc::clone(&self.rejection),
+            session_rejection: Arc::clone(&self.session_rejection),
             server_close: Arc::clone(&self.server_close),
             disconnect_reason: Arc::clone(&self.disconnect_reason),
             link_binding: Arc::clone(&self.link_binding),
