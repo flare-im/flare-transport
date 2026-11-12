@@ -279,6 +279,33 @@ pub fn kicked(
     )
 }
 
+/// 创建 DEVICE_STATE 命令（客户端上报设备状态）。
+///
+/// `data` 是上层定义的状态载荷，传输层只负责送达，不解释内容。
+pub fn device_state(data: Vec<u8>) -> SystemCommand {
+    create_system_command_with_data(
+        SystemType::DeviceState,
+        SerializationFormat::Protobuf,
+        String::new(),
+        None,
+        Some(data),
+    )
+}
+
+/// 创建 DEVICE_STATE_ACK 命令（服务端确认设备状态）。
+///
+/// 服务端在处理完对应的 DEVICE_STATE 之后写出。同一条连接上帧按写出顺序到达，
+/// 所以客户端收到它时，服务端在此之前写出的帧都已经到了。
+pub fn device_state_ack(data: Vec<u8>) -> SystemCommand {
+    create_system_command_with_data(
+        SystemType::DeviceStateAck,
+        SerializationFormat::Protobuf,
+        String::new(),
+        None,
+        Some(data),
+    )
+}
+
 // ============================================================================
 // 载荷命令构建方法
 // ============================================================================

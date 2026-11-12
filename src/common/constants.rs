@@ -64,6 +64,11 @@ pub mod metadata_keys {
     /// CONNECT：客户端当前接入清单的 serial；CONNECT_ACK：服务端已知的最新 serial（都是十进制）。
     pub const ACCESS_SERIAL: &str = "access_serial";
 
+    /// CONNECT：建连时的设备应用状态，小写文本 `active`（前台）、`standby`（后台，本进程自己提示）或
+    /// `deferred`（后台，提示交给推送通道）；缺省或其他值按前台处理。
+    /// 只带状态本身，角标等其余内容由连上之后的 DEVICE_STATE 命令补齐。传输层不解释。
+    pub const DEVICE_STATE: &str = "device_state";
+
     /// CONNECT_ACK：服务端当前时间（Unix 毫秒，十进制），客户端据此修正时钟偏差。
     pub const SERVER_TIME_MS: &str = "server_time_ms";
     /// CONNECT_ACK：服务端建议的心跳间隔（秒，十进制）。

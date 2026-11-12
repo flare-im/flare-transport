@@ -242,6 +242,37 @@ impl ServerMessageWrapper {
                     }
                 });
             }
+            Ok(SysType::DeviceState) => {
+                // 处理 DEVICE_STATE：在读循环里就地等待，保证同一条连接的多次上报按到达顺序处理；
+                // 回复帧排在此前已写出的帧之后，客户端据此判断「确认之前的帧都已到达」。
+                self.update_connection_active_async(connection_id);
+
+                match self
+                    .event_handler
+                    .handle_device_state(frame, connection_id)
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        if let Some(manager) = &self.connection_manager {
+                            self.send_response_frame_async(
+                                response,
+                                connection_id,
+                                "handle_device_state",
+                                manager,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "[ServerMessageWrapper] handle_device_state: 处理失败, connection_id={}, error={}",
+                            connection_id,
+                            e
+                        );
+                    }
+                }
+            }
             Ok(SysType::NegotiationReady) => {
                 // 处理 NEGOTIATION_READY：标记协商已确认
                 self.update_connection_active_async(connection_id);

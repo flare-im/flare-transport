@@ -94,6 +94,10 @@ pub mod system_command {
         Kicked = 10,
         /// 协商完成确认（客户端收到 CONNECT_ACK 后发送，表示已准备好使用协商好的加密方式）
         NegotiationReady = 11,
+        /// 设备状态上报（客户端→服务端；data 为上层定义的状态载荷，传输层不解释）
+        DeviceState = 12,
+        /// 设备状态确认（服务端→客户端；data 为上层定义的确认载荷）
+        DeviceStateAck = 13,
     }
     impl Type {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -112,6 +116,8 @@ pub mod system_command {
                 Self::Event => "EVENT",
                 Self::Kicked => "KICKED",
                 Self::NegotiationReady => "NEGOTIATION_READY",
+                Self::DeviceState => "DEVICE_STATE",
+                Self::DeviceStateAck => "DEVICE_STATE_ACK",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -127,6 +133,8 @@ pub mod system_command {
                 "EVENT" => Some(Self::Event),
                 "KICKED" => Some(Self::Kicked),
                 "NEGOTIATION_READY" => Some(Self::NegotiationReady),
+                "DEVICE_STATE" => Some(Self::DeviceState),
+                "DEVICE_STATE_ACK" => Some(Self::DeviceStateAck),
                 _ => None,
             }
         }

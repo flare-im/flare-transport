@@ -192,6 +192,17 @@
 
 ### 新增
 
+- 系统命令增加 `DEVICE_STATE = 12` 与 `DEVICE_STATE_ACK = 13`：客户端上报设备状态，服务端确认。
+  `data` 是上层定义的载荷，传输层不解释。构建函数 `device_state`、`device_state_ack`。
+  服务端新增 `ServerEventHandler::handle_device_state`，在连接的读循环里按到达顺序调用，
+  返回的帧发回客户端；默认实现不处理也不回复。客户端收到 `DEVICE_STATE_ACK` 后转给
+  `ClientEventHandler::handle_system_command`。同一条连接上帧按写出顺序到达，所以客户端
+  收到确认时，服务端在确认之前写出的帧都已经到了。
+- CONNECT 元数据键 `metadata_keys::DEVICE_STATE`：建连时的设备应用状态，小写文本 `active`、
+  `standby` 或 `deferred`，缺省按前台处理。
+- 客户端在协商完成后应答服务端发来的 PING。此前只有客户端发 PING、服务端回 PONG；服务端
+  主动探活时收不到应答，无法区分「进程还在」和「连接已经没人读」。
+
 - 踢线的类型化原因约定（`common::kick`）：`DEVICE_CONFLICT_REASON`、`TENANT_UNAVAILABLE_REASON`
   （原 `client::transports::client_core::TENANT_UNAVAILABLE_REASON` 保留为它的重导出）、
   `device_conflict_kicked`、`is_device_conflict_kick`、`kick_reason`、`is_device_conflict_reason`、

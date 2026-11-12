@@ -169,4 +169,22 @@ pub trait ServerEventHandler: Send + Sync {
         let _ = (frame, connection_id);
         Ok(None)
     }
+
+    /// 处理设备状态上报（System::DeviceState）
+    ///
+    /// # 返回
+    /// 可选回复 Frame，通常是一条 DEVICE_STATE_ACK。
+    ///
+    /// # 说明
+    /// 在连接的读循环里按到达顺序依次调用，同一条连接上的多次上报不会乱序，
+    /// 所以实现必须很快返回：只改内存状态，耗时的工作自行派发到后台任务。
+    /// 默认实现返回 None，表示不处理也不回复。
+    async fn handle_device_state(
+        &self,
+        frame: &Frame,
+        connection_id: &str,
+    ) -> Result<Option<Frame>> {
+        let _ = (frame, connection_id);
+        Ok(None)
+    }
 }

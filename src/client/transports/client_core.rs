@@ -835,7 +835,58 @@ impl ClientCore {
                     .await;
                 true
             }
+            SystemCommandType::DeviceStateAck => {
+                self.handle_device_state_ack_command(frame).await;
+                true
+            }
+            SystemCommandType::Ping if negotiated_at_receipt => {
+                self.handle_ping_command().await;
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// 处理服务端发来的 PING：回一枚 PONG。
+    ///
+    /// 服务端的下行帧迟迟等不到送达确认时，会怀疑这条连接已经没人读，于是主动探活：限时内收不到
+    /// PONG 就关连接，把新消息的提示转交推送通道。进程被系统挂起或冻结时这里不会执行，
+    /// 而内核仍在应答 TCP，这正是服务端要靠应用层探活才能发现的情况。
+    async fn handle_ping_command(&self) {
+        use crate::common::protocol::{Reliability, frame_with_system_command, pong};
+
+        let frame = frame_with_system_command(pong(), Reliability::AtLeastOnce);
+        let data = {
+            let parser = self.parser.lock().await;
+            match parser.serialize(&frame) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!("[ClientCore] 序列化 PONG 失败: {}", e);
+                    return;
+                }
+            }
+        };
+        let connection = match self.client_connection.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        let Some(connection) = connection else {
+            return;
+        };
+        let mut conn = connection.lock().await;
+        if let Err(e) = conn.send(&data).await {
+            tracing::debug!("[ClientCore] 回复 PONG 失败: {}", e);
+        }
+    }
+
+    /// 处理 DEVICE_STATE_ACK 命令：载荷由上层定义，这里只转交事件处理器。
+    ///
+    /// 观察者在此之前已经收到原始帧（见 `notify_observers`），两条路径任选其一消费即可。
+    async fn handle_device_state_ack_command(&self, frame: &Frame) {
+        if let Some(ref handler) = self.event_handler {
+            let _ = handler
+                .handle_system_command(SystemCommandType::DeviceStateAck, frame)
+                .await;
         }
     }
 
